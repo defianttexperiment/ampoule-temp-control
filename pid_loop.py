@@ -90,7 +90,7 @@ def main():
     previousError = 0
     correctionRate = 0 # hyperparameter of correction
     clockRollValue = 5000 # frequency = 80 MHz / clockRollValue
-    configAValue = clockRollValue
+    configAValue = 5000
     configAValueInitial = configAValue
     ljm.startInterval(intervalHandle, timeStep)
     ljm.eWriteName(handle, "DIO0_EF_ENABLE", 0)
@@ -108,7 +108,7 @@ def main():
             currentTemp = 0 
             tsicVoltage = 0
             tsicVoltage = ljm.eReadName(handle, "AIN0") # DONE BUT variable might give an error
-            currentTemp = tsicVoltage * 70 - 10 # convert V to T, see tsic docs
+            currentTemp = tsicVoltage * 70 - 10.7 # convert V to T, see tsic docs. -0.7 done using ice water calibration.
             print("Current temp: %s" % currentTemp)
             """ CODE FOR THERMOCOUPLE
             ljm.eWriteName(handle,"AIN0_EF_INDEX", 21)

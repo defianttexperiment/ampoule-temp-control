@@ -3,6 +3,7 @@ import sys
 import csv  
 import threading
 import datetime
+import os
 from labjack import ljm  
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
@@ -182,7 +183,27 @@ if __name__ == "__main__":
 
         pid_thread = threading.Thread(target=main_pid, daemon=True)
         pid_thread.start()
-        print("Pid thread started")
+
+        def exit_after_timeout():
+            # Sleep for 30 minutes (1800 seconds)
+            print("5s sleep in temp_sensor")
+            time.sleep(1800)
+            print("\nReached 30-minute timeout. Shutting down...")
+
+            # Save figure
+            exittimestamp = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
+            plt.savefig(f'overnight_{exittimestamp}.png')
+            
+            plt.close(fig)
+
+            exit_event.set()
+            # Give a moment for threads to clean up
+            time.sleep(1)
+            # Force exit if needed
+            os._exit(0)
+        
+        timeout_thread = threading.Thread(target=exit_after_timeout, daemon=True)
+        timeout_thread.start()
 
         # Run Matplotlib in main thread
         fig, ax = plt.subplots(figsize=(8, 6))
