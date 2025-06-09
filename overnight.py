@@ -7,16 +7,16 @@ print(f"Connected to: {supply.identify()}")
 supply.reset()
 supply.clear()
 supply.output_on()
-supply.set_current_limit(2)
-for i in range(19):
-    voltage = 0.2 + 0.1*i
+supply.set_voltage(0.5)
+print("Running temp_sensor")
+os.system('python temp_sensor.py -1 15 1 1 1')
+for i in range(1001):
+    voltage = 0.5 + 0.001*i
     print(f"Starting run with voltage {voltage}")
     supply.set_voltage(voltage)
-    time.sleep(1)
+    time.sleep(2)
     print(f"New voltage: {supply.get_measured_voltage()}")
-    print("Running temp_sensor")
-    os.system('python temp_sensor.py -1 15 1 1 1')
-    time.sleep(5)
+    time.sleep(10)
 supply.output_off()
 supply.output_off()
 supply.output_off()
