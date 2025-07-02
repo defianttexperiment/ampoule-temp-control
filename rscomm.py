@@ -34,8 +34,6 @@ class E3644A:
         )
         
         # Clear any existing commands and reset
-        self.reset()
-        time.sleep(5)  # Allow time for the reset to complete
 
     def close(self):
         """Close the serial connection"""

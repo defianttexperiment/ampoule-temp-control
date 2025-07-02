@@ -1,7 +1,4 @@
 """
-Performs an initial call to eWriteNames to write configuration values, and then
-calls eWriteNames and eReadNames repeatedly in a loop.
-
 Relevant Documentation:
  
 LJM Library:
@@ -107,8 +104,8 @@ def main():
             # DONE read temp
             currentTemp = 0 
             tsicVoltage = 0
-            tsicVoltage = ljm.eReadName(handle, "AIN0") # DONE BUT variable might give an error
-            currentTemp = tsicVoltage * 70 - 10.7 # convert V to T, see tsic docs. -0.7 done using ice water calibration.
+            tsicVoltage = ljm.eReadName(handle, "AIN0")
+            currentTemp = tsicVoltage * 70 - 10
             print("Current temp: %s" % currentTemp)
             """ CODE FOR THERMOCOUPLE
             ljm.eWriteName(handle,"AIN0_EF_INDEX", 21)
