@@ -4,7 +4,7 @@ import os
 from statistics import mean, stdev
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.signal import find_peaks, savgol_filter
+from scipy.signal import find_peaks, find_peaks_cwt, savgol_filter, morlet
 
 """
 def combine_csv_files(, output_file):
@@ -27,10 +27,19 @@ def combine_csv_files(, output_file):
     print(f"Combined data saved to {output_file}")
 """
 # Ways to use this function
+file_name = '0716_swings_random'
+temp_input_is_raw_data = False
 show_temp_data = False # Displays temp data instead of peaks data
+use_time_as_axis = True
+show_peak_lines = True
+interval = 10 # Factor of data compression, change to remove more or less data
+
+# Change window of data used. Swings: 300-1600 for cooling & 1800-3100 for warming; subtract 300 for 0709
+start_time = 0
+end_time = 10000
 
 # Load all finals in waveforms directory
-directory_path = os.getcwd() + '/20250625'
+directory_path = os.getcwd() + '/' + file_name
 try:
     all_files = [f for f in os.listdir(directory_path) if f.endswith('.csv')]
     if not all_files:
@@ -41,12 +50,9 @@ except:
 # Initializations
 fulltimedata = []
 fullchanneldata = []
+fullchannelbdata = []
 df_list = []
-csv_name = '20250625data.csv'
-
-# Change window of data used. 
-start_time = 600
-end_time = 100000
+csv_name = file_name + 'data.csv'
 
 try:
     initial_data = pd.read_csv(csv_name)
@@ -54,6 +60,8 @@ try:
     fulltimedata.pop(0)
     fullchanneldata = initial_data['Channel A'].tolist()
     fullchanneldata.pop(0)
+    fullchannelbdata = initial_data['Channel B'].tolist()
+    fullchannelbdata.pop(0)
 except:
     # Add time & data from every file
     for file in all_files:
@@ -78,21 +86,34 @@ except:
                 channeldata.append(channeldata[-1])
         fullchanneldata.extend(channeldata)
 
-    finaldf = pd.DataFrame(list(zip(fulltimedata, fullchanneldata)), columns = ['Time', 'Channel A'])
+        try:
+            strchannelbdata = initial_data['Channel B'].tolist()
+            strchannelbdata = strchannelbdata[2:]
+            channelbdata = []
+            for s in strchannelbdata:
+                try:
+                    channelbdata.append(float(s))
+                except ValueError:
+                    channelbdata.append(channelbdata[-1])
+            fullchannelbdata.extend(channelbdata)
+        except:
+            print("No Channel B data found.")
+
+    finaldf = pd.DataFrame(list(zip(fulltimedata, fullchanneldata, fullchannelbdata)), columns = ['Time', 'Channel A', 'Channel B'])
     finaldf.to_csv(csv_name, index=False)
-
-
-interval = 10 # Factor of reduction, change to remove more or less data
 
 # Condense channel & time data
 smchanneldata = []
+smchannelbdata = []
 smtimedata = []
 for i in range(int(len(fullchanneldata)/interval)):
     start = interval*i
     end = interval*i+(interval-1)
     smchanneldata.append(mean(fullchanneldata[start:end]))
+    smchannelbdata.append(mean(fullchannelbdata[start:end]))
     smtimedata.append(fulltimedata[start])
 
+# Cut channel & time data to time constraints
 if smtimedata[0] < start_time:
     print(len(smtimedata))
     for i in range(len(smtimedata)):
@@ -101,6 +122,7 @@ if smtimedata[0] < start_time:
         else:
             smtimedata = smtimedata[i:]
             smchanneldata = smchanneldata[i:]
+            smchannelbdata = smchannelbdata[i:]
             print("Cut early at index %s" % i)
             break
 if smtimedata[-1] > end_time:
@@ -110,11 +132,13 @@ if smtimedata[-1] > end_time:
         else:
             smtimedata = smtimedata[:len(smtimedata)-1-i]
             smchanneldata = smchanneldata[:len(smchanneldata)-1-i]
+            smchannelbdata = smchannelbdata[:len(smchannelbdata)-1-i]
             print("Cut late at index %s" % i)
             break
 
 # Apply smoothing to channel data
-smoothed_data = savgol_filter(smchanneldata, window_length=201, polyorder=3)
+smoothed_data = savgol_filter(smchanneldata, window_length=101, polyorder=3)
+smoothed_b_data = savgol_filter(smchannelbdata, window_length=101, polyorder=3)
 
 
 
@@ -128,26 +152,34 @@ all_troughs = []
 
 # Different parameters for different segments
 segments = [segment1, segment2, segment3]
-prominences = [1, 1, 1]
+prominences = [4, 4, 4]
+
+# Defining wavelet for find_peaks_cwt
+morlet_wavelet = lambda M, s: morlet(M, w=5, s=s, complete=False)
 
 for seg, prom in zip(segments, prominences):
     # Find peaks in segment
     peaks, _ = find_peaks(smoothed_data[seg], 
                          prominence=prom,
                          distance=200)
+    # peaks = find_peaks_cwt(smoothed_data[seg], np.arange(30,500), min_snr = 0.1) # Uses wavelet matching
+    
     
     # Adjust indices to full data
     if seg.start:
         peaks += seg.start
     all_peaks.extend(peaks)
     
+    """
     # Find troughs
-    troughs, _ = find_peaks(-smoothed_data[seg],
-                           prominence=prom,
-                           distance=200)
+    troughs = find_peaks_cwt(smoothed_data[seg], np.arange(30,500,10), min_snr = 0.3)
+    # troughs, _ = find_peaks(-smoothed_data[seg],
+                           # prominence=prom,
+                           # distance=200)
     if seg.start:
         troughs += seg.start
     all_troughs.extend(troughs)
+    """
 
 all_peaks_times = []
 all_troughs_times = []
@@ -195,15 +227,42 @@ def sliding_window_peak_rate(all_peaks_times, time_array, window_size=1):
 
 
 # Import temperature data
-raw_temp_data = pd.read_csv("20250625Tdata.csv")
+raw_temp_data = pd.read_csv(file_name + 'Tdata.csv')
 temp_data = raw_temp_data['TSic AIN0 (°C)'].tolist()
 temp_time_data = raw_temp_data['Time (s)'].tolist()
 
-# Correcting for 0.2C bias in TSic placement
-for i in range(len(temp_data)):
-    temp_data[i] = temp_data[i]-0.2
-
-# Remove data outside the window we want
+# Smooth out raw temperature data.
+sum_numerator = 0
+sum_denominator = 0
+# Smooth out raw temperature data.
+if temp_input_is_raw_data:
+    print("Smoothing raw temperature data.")
+    smoothing_range = 120 # averages over this range *before* the given datum
+    placeholder_temp_data = []
+    for i in range(len(temp_data)):
+        sum_numerator = 0
+        sum_denominator = 0
+        start = max(0, i-smoothing_range)  # Cleaner way to handle negative start
+        
+        try: 
+            # Theory: Do a weighted average of the most recent smoothing_range data points with exponential 0.5^(t/20).
+            for j in range(start, i+1):  # Simplified - just iterate from start to current index
+                time_diff = i - j  # How far back this point is
+                weight = 0.5**(time_diff/20)
+                sum_numerator += temp_data[j] * weight
+                sum_denominator += weight
+            
+            # Add safety check for division by zero
+            if sum_denominator > 0:
+                placeholder_temp_data.append(sum_numerator/sum_denominator)
+            else:
+                placeholder_temp_data.append(temp_data[i])  # Fallback to original value
+                
+        except Exception as e: 
+            print(e)
+            placeholder_temp_data.append(temp_data[i])
+    temp_data = placeholder_temp_data
+# Remove data outside the previously defined window
 if temp_time_data[0] < start_time:
     for i in range(len(temp_time_data)):
         if temp_time_data[i] < start_time:
@@ -221,7 +280,7 @@ if temp_time_data[-1] > end_time:
             temp_data = temp_data[:len(temp_data)-1-i]
             break
 
-smooth_temp_data = savgol_filter(temp_data, window_length=400, polyorder=3)
+smooth_temp_data = savgol_filter(temp_data, window_length=120, polyorder=3) # originally 120 with non-raw data
 
 if show_temp_data:
     plt.plot(temp_time_data, temp_data, temp_time_data, smooth_temp_data)
@@ -261,24 +320,53 @@ for trough_time in all_troughs_times:
 
 # Plot figures
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+ax3 = ax2.twinx() 
 
 # Left plot: actual & smoothed data
-ax1.plot(timed_temp_data, smchanneldata, label='Raw data', alpha=0.7)
-ax1.plot(timed_temp_data, smoothed_data, label='Smoothed data', linewidth=2)
-ax1.vlines(all_peaks_temps, 0, 10, colors="red", alpha=0.5, label='Peaks')
-ax1.vlines(all_troughs_temps, 0, 10, colors="green", alpha=0.5, label='Troughs')
-ax1.set_xlabel('Temperature (°C)')
+if use_time_as_axis:
+    ax1.plot(smtimedata, smchanneldata, label='Raw data', alpha=0.2)
+    ax1.plot(smtimedata, smoothed_data, label='Smoothed data', linewidth=2)
+    ax1.plot(smtimedata, smoothed_b_data, label='Scattering data', linewidth=2)
+    if show_peak_lines:
+        ax1.vlines(all_peaks_times, 0, 20, colors="grey", alpha=0.4, label='Peaks')
+        ax1.vlines(all_troughs_times, 0, 20, colors="green", alpha=0.4, label='Troughs')
+    ax1.set_xlabel('Time (s)')
+else:
+    ax1.plot(timed_temp_data, smchanneldata, label='Raw data', alpha=0.2)
+    ax1.plot(timed_temp_data, smoothed_data, label='Smoothed data', linewidth=2)
+    ax1.plot(timed_temp_data, smoothed_b_data, label='Scattering data', linewidth=2)
+    if show_peak_lines:
+        ax1.vlines(all_peaks_temps, 0, 20, colors="grey", alpha=0.4, label='Peaks')
+        ax1.vlines(all_troughs_temps, 0, 20, colors="green", alpha=0.4, label='Troughs')
+    ax1.set_xlabel('Temperature (°C)')
 ax1.set_ylabel('Signal Value')
 ax1.set_title('Signal Data with Detected Peaks and Troughs')
 ax1.legend()
 
+# Calculate derivative for second plot
+b_rate_of_change = []
+for i in range(len(smoothed_b_data)):
+    try:
+        b_rate_of_change.append((smoothed_b_data[i+250]-smoothed_b_data[i])*100)
+    except:
+        continue
+
 # Right plot: peak density
-peak_rate = sliding_window_peak_rate(all_peaks_temps, timed_temp_data, window_size=0.2)
+peak_rate = sliding_window_peak_rate(all_peaks_temps, timed_temp_data, window_size=0.002)
 smooth_peak_rate = savgol_filter(peak_rate, window_length=5000, polyorder=3)
-ax2.plot(timed_temp_data, smooth_peak_rate, 'b-', linewidth=2)
-ax2.set_xlabel('Temperature (°C)')
+if use_time_as_axis:
+    ax2.plot(smtimedata, smooth_peak_rate, 'b-', linewidth=2)
+    ax3.plot(smtimedata[250:], b_rate_of_change, label='Scattering data', linewidth=2, alpha=0.4)
+    ax2.set_xlabel('Time (s))')
+else:
+    ax2.plot(timed_temp_data, smooth_peak_rate, 'b-', linewidth=2)
+    ax3.plot(timed_temp_data[250:], b_rate_of_change, label='Scattering data', linewidth=2, alpha=0.4)
+    ax2.set_xlabel('Temperature (°C)')
 ax2.set_ylabel('Peaks per degree')
+ax3.set_ylabel('Differential of scattering data')
 ax2.set_title('Peak Density (0.2°C window)')
+ax2.legend() # TODO: fix for ax3
+
 
 # Add debug prints to understand what's happening
 print(f"Signal data range: {smtimedata[0]:.1f} to {smtimedata[-1]:.1f}")

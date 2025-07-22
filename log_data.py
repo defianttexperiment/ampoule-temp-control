@@ -13,7 +13,7 @@ from rscomm import *
 # ---------------- CONFIGURATION ----------------
 # Active Thermocouples (J-type) on LabJack (AIN channels)
 ACTIVE_THERMOCOUPLES = {
-    "J-2 (center)": {"channel": 2, "type": 21}
+    # "J-2 (center)": {"channel": 2, "type": 21}
     # "J-1 (rear hole cell)": {"channel": 1, "type": 21},  
     # "J-2 (front center hole cell)": {"channel": 2, "type": 21},  
     # "J-5 (mid slot inner wall)": {"channel": 3, "type": 21},  
