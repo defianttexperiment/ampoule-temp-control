@@ -1,15 +1,22 @@
 # ampoule-temp-control
 
+## Setting up
+
+
 ## temp_sensor.py
-The main function in this repo. This reads the temperature of the system and controls the voltage to affect temperature as necessary.
+The main function in this repo. This does three things:
 
-Forked from Barkotel's temp_sensor function.
+1. Measures temperature using TSic or thermocouple sensors (based on the list of sensors given in the code) and outputs it to a live-updating graph. The graph smooths data Current default is to use a single TSic sensor through the LabJack AIN0 port. 
+2. Outputs temperature data in a sensor_readings file. Note that this data is raw temperature measurements, while the graph represents smoothed data over log_data_average_interval seconds.
+3. Controls the voltage of the power supply to control the temperature. See options below for how to do this.
 
-### Threads in temp_sensor.py
-log_data: Logs temperature data in a CSV and plots it on the screen.
-slow_control: Sweeps across a certain voltage range. Used and edited for overnight runs.
-pid: Formerly used to call pid_loop.py.
-timeout: Used to stop the program after a certain amount of time.
+### Options in temp_sensor.py
+slow_control: 
+pid_control:
+pid_slow_control: 
+
+## log_data.py
+A fork of temp_sensor.py that has all control options turned off. Used as an option to quickly log data when I don't want to change the variables in temp_sensor.
 
 ## pico_data.py
 The main function in this repo for data analysis. Compresses and smooths CSV data from the PicoScope, detects fringes in the data, and plots fringe count with respect to temperature.
@@ -17,10 +24,5 @@ The main function in this repo for data analysis. Compresses and smooths CSV dat
 ## rscomm.py
 Used to communicate with the power supply. Mostly used to import functions; generally does not need to be called on its own.
 
-## overnight.py
-NOW OUTDATED. Use temp_sensor with run_slow_control = True. 
-
-Used to collect overnight data. Can be called without parameters. Tries a certain set of voltages at even steps and records data for a certain time interval (1800s = 30m by default).
-
-## pid_loop.py
-NOW OUTDATED. Old code used to keep temperature stable.
+## motorcomm.py
+Used to communicate with the Z-axis motor. Used on its own, but currently a work in progress.

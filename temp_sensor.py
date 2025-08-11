@@ -20,10 +20,15 @@ log_data_record_raw_data = True # Independent of smoothing interval, record raw 
 
 # Decides whether to run temperature control components
 run_slow_control = False # Runs voltage sweep
-run_pid_control = False # Runs PID controller
-run_pid_slow_control = True
-pid_desired_temp = 16.7
+run_pid_control = True # Runs PID controller
+run_pid_slow_control = False
+pid_desired_temp = 17.0
 pid_interval = 15
+pid_slow_control_starting_temp = 17.0
+pid_slow_control_ending_temp = 17.6
+pid_slow_control_voltage_finding_time = 225
+pid_slow_control_intermediate_settling_time = 0
+pid_slow_control_swing_time = 1200
 
 # Decides whether to run timeout components
 run_timeout = False # Determines whether to end program after a certain time period
@@ -130,9 +135,16 @@ def configure_thermocouple(handle):
     for name, config in ACTIVE_THERMOCOUPLES.items():
         ain_channel = config["channel"]
         tc_type = config["type"]
+        ljm.eWriteName(handle, f"AIN{ain_channel}_RANGE", 1.0)
+        print(ljm.eReadName(handle, f"AIN{ain_channel}_RANGE"))
         ljm.eWriteName(handle, f"AIN{ain_channel}_EF_INDEX", tc_type)
         ljm.eWriteName(handle, f"AIN{ain_channel}_EF_CONFIG_A", 1)  # °C output
         print(f"Configured {name} thermocouple on AIN{ain_channel}")
+
+def configure_tsic(handle):
+    for ain_channel in ACTIVE_TSIC_CHANNELS:
+        ljm.eWriteName(handle, f"AIN{ain_channel}_RANGE", 1.0)
+        ljm.eWriteName(handle, f"AIN{ain_channel}_RESOLUTION_INDEX", 8)
 
 def read_sensors():
     """Reads all active thermocouples and TSic sensors from LabJack."""
@@ -147,7 +159,7 @@ def read_sensors():
         
         # Read TSic sensors
         tsic_temps = {
-            ch: -10 + (ljm.eReadName(handle, f"AIN{ch}") * 70)  
+            ch: -10 + float(ljm.eReadName(handle, f"AIN{ch}")) * 70
             for ch in ACTIVE_TSIC_CHANNELS
         }
         
@@ -380,8 +392,44 @@ def pid_slow_control(interval, supply):
     k_int = 0 # recommended: 0.0127
     k_deriv = 7.17 # recommended: 7.17
 
-    for i in range(10): # total time (s) = this number * interval)
-        desired_temp = 16.4
+    for i in range(int(pid_slow_control_voltage_finding_time/pid_interval)): # total time (s) = this number * interval)
+        desired_temp = pid_slow_control_ending_temp
+
+        # Updating values
+        current_temp = shared_data.get_avg_temperature()
+
+        # PID calculation
+        error = desired_temp - current_temp
+        P_out = k_prop * error
+        integral += error * interval
+        I_out = k_int * integral
+        derivative = (error - previous_error) / interval
+        D_out = k_deriv * derivative
+        
+        # Act on PID calculation
+        previous_error = error
+        correction = (P_out + I_out + D_out)*-1
+        voltage = voltage + correction
+        pid_voltage_archive.append(voltage)
+        if voltage < 0: voltage = 0
+        if voltage > 3: voltage = 3
+        try:
+            supply.set_voltage(voltage)
+        except Exception as e:
+            print(f"Error setting voltage: {e}")
+
+        print("Prop: %s" % P_out)
+        print("Int: %s" % I_out)
+        print("Deriv: %s" % D_out)
+        print("Error: %s" % error)
+        print("Correction: %s" % correction)
+
+        time.sleep(interval)
+
+    ending_voltage = voltage
+
+    for i in range(int(pid_slow_control_voltage_finding_time/pid_interval)): # total time (s) = this number * interval)
+        desired_temp = pid_slow_control_starting_temp
 
         # Updating values
         current_temp = shared_data.get_avg_temperature()
@@ -414,351 +462,36 @@ def pid_slow_control(interval, supply):
 
         time.sleep(interval)
 
-    for i in range(5): # total time (s) = this number * interval)
-        desired_temp = 16.4 + 0.04*i
+    starting_voltage = voltage
+    time.sleep(pid_slow_control_intermediate_settling_time)
 
-        # Updating values
-        current_temp = shared_data.get_avg_temperature()
-
-        # PID calculation
-        error = desired_temp - current_temp
-        P_out = k_prop * error
-        integral += error * interval
-        I_out = k_int * integral
-        derivative = (error - previous_error) / interval
-        D_out = k_deriv * derivative
-            
-        # Act on PID calculation
-        previous_error = error
-        correction = (P_out + I_out + D_out)*-1
-        voltage = voltage + correction
-        pid_voltage_archive.append(voltage)
-        print(pid_voltage_archive)
-        try:
+    if starting_voltage < ending_voltage:
+        for i in range(int((ending_voltage-starting_voltage)*1000)):
+            voltage = starting_voltage + 0.001*i
+            print(f"Voltage set to {voltage}")
             supply.set_voltage(voltage)
-        except Exception as e:
-            print(f"Error setting voltage: {e}")
-            continue
-
-        print("Prop: %s" % P_out)
-        print("Int: %s" % I_out)
-        print("Deriv: %s" % D_out)
-        print("Error: %s" % error)
-        print("Correction: %s" % correction)
-
-        time.sleep(interval)
-
-    time.sleep(180)
-    for i in range(10): # total time (s) = this number * interval)
-        desired_temp = 16.4
-
-        # Updating values
-        current_temp = shared_data.get_avg_temperature()
-
-        # PID calculation
-        error = desired_temp - current_temp
-        P_out = k_prop * error
-        integral += error * interval
-        I_out = k_int * integral
-        derivative = (error - previous_error) / interval
-        D_out = k_deriv * derivative
-        
-        # Act on PID calculation
-        previous_error = error
-        correction = (P_out + I_out + D_out)*-1
-        voltage = voltage + correction
-        pid_voltage_archive.append(voltage)
-        print(pid_voltage_archive)
-        try:
+            time.sleep(pid_slow_control_swing_time/(abs(ending_voltage-starting_voltage)*1000))
+    else:
+        for i in range(int((starting_voltage-ending_voltage)*1000)):
+            voltage = starting_voltage - 0.001*i
+            print(f"Voltage set to {voltage}")
             supply.set_voltage(voltage)
-        except Exception as e:
-            print(f"Error setting voltage: {e}")
-            continue
+            time.sleep(pid_slow_control_swing_time/((starting_voltage-ending_voltage)*1000))
 
-        print("Prop: %s" % P_out)
-        print("Int: %s" % I_out)
-        print("Deriv: %s" % D_out)
-        print("Error: %s" % error)
-        print("Correction: %s" % correction)
+    time.sleep(600)
 
-        time.sleep(interval)
-
-    for i in range(10): # total time (s) = this number * interval)
-        desired_temp = 16.4 + 0.02*i
-
-        # Updating values
-        current_temp = shared_data.get_avg_temperature()
-
-        # PID calculation
-        error = desired_temp - current_temp
-        P_out = k_prop * error
-        integral += error * interval
-        I_out = k_int * integral
-        derivative = (error - previous_error) / interval
-        D_out = k_deriv * derivative
-        
-        # Act on PID calculation
-        previous_error = error
-        correction = (P_out + I_out + D_out)*-1
-        voltage = voltage + correction
-        pid_voltage_archive.append(voltage)
-        print(pid_voltage_archive)
-        try:
+    if starting_voltage < ending_voltage:
+        for i in range(int((ending_voltage-starting_voltage)*1000)):
+            voltage = ending_voltage - 0.001*i
+            print(f"Voltage set to {voltage}")
             supply.set_voltage(voltage)
-        except Exception as e:
-            print(f"Error setting voltage: {e}")
-            continue
-
-        print("Prop: %s" % P_out)
-        print("Int: %s" % I_out)
-        print("Deriv: %s" % D_out)
-        print("Error: %s" % error)
-        print("Correction: %s" % correction)
-
-        time.sleep(interval)
-
-    time.sleep(180)
-    for i in range(10): # total time (s) = this number * interval)
-        desired_temp = 16.4
-
-        # Updating values
-        current_temp = shared_data.get_avg_temperature()
-
-        # PID calculation
-        error = desired_temp - current_temp
-        P_out = k_prop * error
-        integral += error * interval
-        I_out = k_int * integral
-        derivative = (error - previous_error) / interval
-        D_out = k_deriv * derivative
-        
-        # Act on PID calculation
-        previous_error = error
-        correction = (P_out + I_out + D_out)*-1
-        voltage = voltage + correction
-        pid_voltage_archive.append(voltage)
-        print(pid_voltage_archive)
-        try:
+            time.sleep(pid_slow_control_swing_time/(abs(ending_voltage-starting_voltage)*1000))
+    else:
+        for i in range(int((starting_voltage-ending_voltage)*1000)):
+            voltage = ending_voltage + 0.001*i
+            print(f"Voltage set to {voltage}")
             supply.set_voltage(voltage)
-        except Exception as e:
-            print(f"Error setting voltage: {e}")
-            continue
-
-        print("Prop: %s" % P_out)
-        print("Int: %s" % I_out)
-        print("Deriv: %s" % D_out)
-        print("Error: %s" % error)
-        print("Correction: %s" % correction)
-
-        time.sleep(interval)
-    
-    for i in range(20): # total time (s) = this number * interval)
-        desired_temp = 16.4 + 0.01*i
-
-        # Updating values
-        current_temp = shared_data.get_avg_temperature()
-
-        # PID calculation
-        error = desired_temp - current_temp
-        P_out = k_prop * error
-        integral += error * interval
-        I_out = k_int * integral
-        derivative = (error - previous_error) / interval
-        D_out = k_deriv * derivative
-        
-        # Act on PID calculation
-        previous_error = error
-        correction = (P_out + I_out + D_out)*-1
-        voltage = voltage + correction
-        pid_voltage_archive.append(voltage)
-        print(pid_voltage_archive)
-        try:
-            supply.set_voltage(voltage)
-        except Exception as e:
-            print(f"Error setting voltage: {e}")
-            continue
-
-        print("Prop: %s" % P_out)
-        print("Int: %s" % I_out)
-        print("Deriv: %s" % D_out)
-        print("Error: %s" % error)
-        print("Correction: %s" % correction)
-
-        time.sleep(interval)
-    
-    time.sleep(180)
-    for i in range(10): # total time (s) = this number * interval)
-        desired_temp = 16.4
-
-        # Updating values
-        current_temp = shared_data.get_avg_temperature()
-
-        # PID calculation
-        error = desired_temp - current_temp
-        P_out = k_prop * error
-        integral += error * interval
-        I_out = k_int * integral
-        derivative = (error - previous_error) / interval
-        D_out = k_deriv * derivative
-        
-        # Act on PID calculation
-        previous_error = error
-        correction = (P_out + I_out + D_out)*-1
-        voltage = voltage + correction
-        pid_voltage_archive.append(voltage)
-        print(pid_voltage_archive)
-        try:
-            supply.set_voltage(voltage)
-        except Exception as e:
-            print(f"Error setting voltage: {e}")
-            continue
-
-        print("Prop: %s" % P_out)
-        print("Int: %s" % I_out)
-        print("Deriv: %s" % D_out)
-        print("Error: %s" % error)
-        print("Correction: %s" % correction)
-
-        time.sleep(interval)
-
-    for i in range(40): # total time (s) = this number * interval)
-        desired_temp = 16.4 + 0.005*i
-
-        # Updating values
-        current_temp = shared_data.get_avg_temperature()
-
-        # PID calculation
-        error = desired_temp - current_temp
-        P_out = k_prop * error
-        integral += error * interval
-        I_out = k_int * integral
-        derivative = (error - previous_error) / interval
-        D_out = k_deriv * derivative
-        
-        # Act on PID calculation
-        previous_error = error
-        correction = (P_out + I_out + D_out)*-1
-        voltage = voltage + correction
-        pid_voltage_archive.append(voltage)
-        print(pid_voltage_archive)
-        try:
-            supply.set_voltage(voltage)
-        except Exception as e:
-            print(f"Error setting voltage: {e}")
-            continue
-
-        print("Prop: %s" % P_out)
-        print("Int: %s" % I_out)
-        print("Deriv: %s" % D_out)
-        print("Error: %s" % error)
-        print("Correction: %s" % correction)
-
-        time.sleep(interval)
-
-    time.sleep(180)
-    for i in range(10): # total time (s) = this number * interval)
-        desired_temp = 16.4
-
-        # Updating values
-        current_temp = shared_data.get_avg_temperature()
-
-        # PID calculation
-        error = desired_temp - current_temp
-        P_out = k_prop * error
-        integral += error * interval
-        I_out = k_int * integral
-        derivative = (error - previous_error) / interval
-        D_out = k_deriv * derivative
-        
-        # Act on PID calculation
-        previous_error = error
-        correction = (P_out + I_out + D_out)*-1
-        voltage = voltage + correction
-        pid_voltage_archive.append(voltage)
-        print(pid_voltage_archive)
-        try:
-            supply.set_voltage(voltage)
-        except Exception as e:
-            print(f"Error setting voltage: {e}")
-            continue
-
-        print("Prop: %s" % P_out)
-        print("Int: %s" % I_out)
-        print("Deriv: %s" % D_out)
-        print("Error: %s" % error)
-        print("Correction: %s" % correction)
-
-        time.sleep(interval)
-
-    for i in range(80): # total time (s) = this number * interval)
-        desired_temp = 16.4 + 0.0025*i
-
-        # Updating values
-        current_temp = shared_data.get_avg_temperature()
-
-        # PID calculation
-        error = desired_temp - current_temp
-        P_out = k_prop * error
-        integral += error * interval
-        I_out = k_int * integral
-        derivative = (error - previous_error) / interval
-        D_out = k_deriv * derivative
-        
-        # Act on PID calculation
-        previous_error = error
-        correction = (P_out + I_out + D_out)*-1
-        voltage = voltage + correction
-        pid_voltage_archive.append(voltage)
-        print(pid_voltage_archive)
-        try:
-            supply.set_voltage(voltage)
-        except Exception as e:
-            print(f"Error setting voltage: {e}")
-            continue
-
-        print("Prop: %s" % P_out)
-        print("Int: %s" % I_out)
-        print("Deriv: %s" % D_out)
-        print("Error: %s" % error)
-        print("Correction: %s" % correction)
-
-        time.sleep(interval)
-
-    time.sleep(180)
-    for i in range(10): # total time (s) = this number * interval)
-        desired_temp = 16.4
-
-        # Updating values
-        current_temp = shared_data.get_avg_temperature()
-
-        # PID calculation
-        error = desired_temp - current_temp
-        P_out = k_prop * error
-        integral += error * interval
-        I_out = k_int * integral
-        derivative = (error - previous_error) / interval
-        D_out = k_deriv * derivative
-        
-        # Act on PID calculation
-        previous_error = error
-        correction = (P_out + I_out + D_out)*-1
-        voltage = voltage + correction
-        pid_voltage_archive.append(voltage)
-        print(pid_voltage_archive)
-        try:
-            supply.set_voltage(voltage)
-        except Exception as e:
-            print(f"Error setting voltage: {e}")
-            continue
-
-        print("Prop: %s" % P_out)
-        print("Int: %s" % I_out)
-        print("Deriv: %s" % D_out)
-        print("Error: %s" % error)
-        print("Correction: %s" % correction)
-
-        time.sleep(interval)
-
+            time.sleep(pid_slow_control_swing_time/((starting_voltage-ending_voltage)*1000))
 
 def pid_control(desired_temp, interval):
     """Control thread that adjusts voltage to match a given temperature."""
@@ -779,9 +512,6 @@ def pid_control(desired_temp, interval):
     k = 0
 
     while not exit_event.is_set():
-        if k == 120:
-            k_prop = 0.15
-            k_deriv = 5
 
         # Updating values
         current_temp = shared_data.get_avg_temperature()
@@ -820,6 +550,7 @@ if __name__ == "__main__":
     try:
         handle = ljm.openS("T7", "ANY", "ANY")
         configure_thermocouple(handle)
+        configure_tsic(handle)
         supply = E3644A("/dev/tty.PL2303G-USBtoUART140")
 
         print(f"Starting live temperature monitoring... Data will be saved in {csv_filename}\n")
