@@ -1,7 +1,6 @@
 # ampoule-temp-control
 
-## Setting up
-
+## Setting up PicoScope
 
 ## temp_sensor.py
 The main function in this repo. This does three things:
@@ -15,11 +14,16 @@ slow_control:
 pid_control:
 pid_slow_control: 
 
+(In progress)
+
 ## log_data.py
 A fork of temp_sensor.py that has all control options turned off. Used as an option to quickly log data when I don't want to change the variables in temp_sensor.
 
 ## pico_data.py
 The main function in this repo for data analysis. Compresses and smooths CSV data from the PicoScope, detects fringes in the data, and plots fringe count with respect to temperature.
+
+### Data format for usage in pico_data
+(In progress)
 
 ## rscomm.py
 Used to communicate with the power supply. Mostly used to import functions; generally does not need to be called on its own.

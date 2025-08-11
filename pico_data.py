@@ -44,7 +44,7 @@ end_time = 100000
 
 # ---------------- IMPORT CHANNEL DATA ----------------
 # Load all finals in waveforms directory
-directory_path = os.getcwd() + '/' + file_name
+directory_path = os.getcwd() + '/data_archive/' + file_name
 try:
     all_files = [f for f in os.listdir(directory_path) if f.endswith('.csv')]
     if not all_files:
