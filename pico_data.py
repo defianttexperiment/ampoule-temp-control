@@ -6,51 +6,41 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.signal import find_peaks, find_peaks_cwt, savgol_filter, morlet
 
-"""
-def combine_csv_files(, output_file):
-    all_files = [f for f in os.listdir(directory_path) if f.endswith('.csv')]
-    
-    if not all_files:
-        print("No CSV files found in the directory.")
-        return
-
-    df_list = []
-    for file in all_files:
-        file_path = os.path.join(directory_path, file)
-        df = pd.read_csv(file_path)
-        df.drop(axis=0,index=[0,1])
-        print(df)
-        df_list.append(df)
-    
-    combined_df = pd.concat(df_list, ignore_index=True)
-    combined_df.to_csv(output_file, index=False)
-    print(f"Combined data saved to {output_file}")
-"""
-
 # ---------------- MANUAL CONFIGURATION ----------------
 # Ways to use this function
-file_name = '0804_step_cool'
+file_name = '0703_swing_bottom'
 temp_input_is_raw_data = True
-show_temp_data = False # Displays temp data instead of peaks data
-use_time_as_axis = False
 show_peak_lines = True
+use_channel_b = False
 interval = 10 # Factor of data compression, change to remove more or less data
-half_life = 60 # Factor of drop-off for smoothing raw data
-peak_prominence = 4
+half_life = 10 # Factor of drop-off for smoothing raw data
+peak_prominence = 4 # Height in mV required to be labeled as a peak
+plus_40_correction = True # Recent data has -40 mV as a baseline for some reason
 
-# Change window of data used. Swings: 300-1600 for cooling & 1800-3100 for warming; subtract 300 for 0709
-start_time = 0
-end_time = 100000
+# Change window of data used.
+start_time = 1800
+end_time = 3100
 
 # ---------------- IMPORT CHANNEL DATA ----------------
 # Load all finals in waveforms directory
-directory_path = os.getcwd() + '/data_archive/' + file_name
+directory_path = os.getcwd() + "/" + file_name # + '/data_archive/'
 try:
-    all_files = [f for f in os.listdir(directory_path) if f.endswith('.csv')]
+    test_files = [f for f in os.listdir(directory_path) if f.lower().endswith('.csv')]
+    if os.path.basename(test_files[0])[9:11] == "00":
+        all_files = sorted(
+            (f for f in os.listdir(directory_path) if f.lower().endswith('.csv')),
+            key=lambda f: int(os.path.basename(f)[14:16])  # digits 15 & 16 (1-based)
+        )
+    else:
+        all_files = sorted(
+            (f for f in os.listdir(directory_path) if f.lower().endswith('.csv')),
+            key=lambda f: int(os.path.basename(f)[9:11])  # digits 10 & 11 (1-based)
+        )
+    print(all_files)
     if not all_files:
         print("No CSV files found in the directory.")
-except:
-    print("Files already loaded.")
+except Exception as e:
+    print(f"Exception {e}: Files already loaded.")
 
 # Initializations
 fulltimedata = []
@@ -78,8 +68,12 @@ except:
         fulltimedata.pop(0)
         fullchanneldata = initial_data['Channel A'].tolist()
         fullchanneldata.pop(0)
-        fullchannelbdata = initial_data['Channel B'].tolist()
-        fullchannelbdata.pop(0)
+        if use_channel_b:
+            try:
+                fullchannelbdata = initial_data['Channel B'].tolist()
+                fullchannelbdata.pop(0)
+            except:
+                print('No Channel B data found.')
     except:
         print("Loading data from files...")
         # Add time & data from every file
@@ -105,18 +99,19 @@ except:
                     channeldata.append(channeldata[-1])
             fullchanneldata.extend(channeldata)
 
-            try:
-                strchannelbdata = initial_data['Channel B'].tolist()
-                strchannelbdata = strchannelbdata[2:]
-                channelbdata = []
-                for s in strchannelbdata:
-                    try:
-                        channelbdata.append(float(s))
-                    except ValueError:
-                        channelbdata.append(channelbdata[-1])
-                fullchannelbdata.extend(channelbdata)
-            except:
-                print("No Channel B data found.")
+            if use_channel_b:
+                try:
+                    strchannelbdata = initial_data['Channel B'].tolist()
+                    strchannelbdata = strchannelbdata[2:]
+                    channelbdata = []
+                    for s in strchannelbdata:
+                        try:
+                            channelbdata.append(float(s))
+                        except ValueError:
+                            channelbdata.append(channelbdata[-1])
+                    fullchannelbdata.extend(channelbdata)
+                except:
+                    print("No Channel B data found.")
 
         finaldf = pd.DataFrame(list(zip(fulltimedata, fullchanneldata, fullchannelbdata)), columns = ['Time', 'Channel A', 'Channel B'])
         finaldf.to_csv(csv_name, index=False)
@@ -126,7 +121,8 @@ except:
         start = interval*i
         end = interval*i+(interval-1)
         smchanneldata.append(mean(fullchanneldata[start:end]))
-        smchannelbdata.append(mean(fullchannelbdata[start:end]))
+        if use_channel_b:
+            smchannelbdata.append(mean(fullchannelbdata[start:end]))
         smtimedata.append(fulltimedata[start])
     smdf = pd.DataFrame(list(zip(smtimedata, smchanneldata, smchannelbdata)), columns = ['Time', 'Channel A', 'Channel B'])
     smdf.to_csv(sm_csv_name, index=False)
@@ -142,7 +138,8 @@ if smtimedata[0] < start_time:
         else:
             smtimedata = smtimedata[i:]
             smchanneldata = smchanneldata[i:]
-            smchannelbdata = smchannelbdata[i:]
+            if use_channel_b:
+                smchannelbdata = smchannelbdata[i:]
             print("Cut early at index %s" % i)
             break
 if smtimedata[-1] > end_time:
@@ -152,20 +149,25 @@ if smtimedata[-1] > end_time:
         else:
             smtimedata = smtimedata[:len(smtimedata)-1-i]
             smchanneldata = smchanneldata[:len(smchanneldata)-1-i]
-            smchannelbdata = smchannelbdata[:len(smchannelbdata)-1-i]
+            if use_channel_b:
+                smchannelbdata = smchannelbdata[:len(smchannelbdata)-1-i]
             print("Cut late at index %s" % i)
             break
 
 # Apply smoothing to channel data
 print("Smoothing data...")
 smoothed_data = savgol_filter(smchanneldata, window_length=101, polyorder=3)
-smoothed_b_data = savgol_filter(smchannelbdata, window_length=101, polyorder=3)
+if use_channel_b:
+    smoothed_b_data = savgol_filter(smchannelbdata, window_length=101, polyorder=3)
 
 # ---------------- IMPORT TEMPERATURE DATA ----------------
 # Import temperature data
 print("Importing temperature data...")
 raw_temp_data = pd.read_csv(file_name + 'Tdata.csv')
-temp_data = raw_temp_data['TSic AIN0 (°C)'].tolist()
+try:
+    temp_data = raw_temp_data['TSic AIN0 (°C)'].tolist()
+except:
+    temp_data = raw_temp_data['TSic AIN2 (°C)'].tolist()
 original_temp_data = temp_data
 temp_time_data = raw_temp_data['Time (s)'].tolist()
 
@@ -297,9 +299,13 @@ ax3 = ax2.twinx()
 
 ax1.plot(smtimedata, smchanneldata, label='Raw data', alpha=0.2)
 ax1.plot(smtimedata, smoothed_data, label='Smoothed data', linewidth=2)
-ax1.plot(smtimedata, smoothed_b_data, label='Scattering data', linewidth=2)
+if use_channel_b:
+    ax1.plot(smtimedata, smoothed_b_data, label='Scattering data', linewidth=2)
 if show_peak_lines:
-    ax1.vlines(all_peaks_times, 0, 20, colors="grey", alpha=0.4, label='Peaks')
+    if plus_40_correction:
+        ax1.vlines(all_peaks_times, -40, 20, colors="grey", alpha=0.4, label='Peaks')
+    else:
+        ax1.vlines(all_peaks_times, 0, 20, colors="grey", alpha=0.4, label='Peaks')
 ax1.set_xlabel('Time (s)')
 ax1.set_ylabel('Signal Value')
 ax1.set_title('Signal Data with Detected Peaks')
@@ -307,31 +313,32 @@ ax1.legend()
 
 ax5.plot(timed_temp_data, smchanneldata, label='Raw data', alpha=0.2)
 ax5.plot(timed_temp_data, smoothed_data, label='Smoothed data', linewidth=2)
-ax5.plot(timed_temp_data, smoothed_b_data, label='Scattering data', linewidth=2)
+if use_channel_b:
+    ax5.plot(timed_temp_data, smoothed_b_data, label='Scattering data', linewidth=2)
 if show_peak_lines:
-    ax5.vlines(all_peaks_temps, 0, 20, colors="grey", alpha=0.4, label='Peaks')
+    if plus_40_correction:
+        ax5.vlines(all_peaks_temps, -40, 20, colors="grey", alpha=0.4, label='Peaks')
+    else:
+        ax5.vlines(all_peaks_temps, 0, 20, colors="grey", alpha=0.4, label='Peaks')
 ax5.set_xlabel('Temperature (°C)')
 ax5.set_ylabel('Signal Value')
 ax5.set_title('Signal Data with Detected Peaks')
 
 # Calculate derivative for second plot
-b_rate_of_change = []
-for i in range(len(smoothed_b_data)):
-    try:
-        b_rate_of_change.append((smoothed_b_data[i+250]-smoothed_b_data[i])*100)
-    except:
-        continue
+if use_channel_b:
+    b_rate_of_change = []
+    for i in range(len(smoothed_b_data)):
+        try:
+            b_rate_of_change.append((smoothed_b_data[i+250]-smoothed_b_data[i])*100)
+        except:
+            continue
 
 # Right plot: peak density
 smooth_peak_rate = savgol_filter(peak_rate, window_length=5000, polyorder=3)
-if use_time_as_axis:
-    ax2.plot(smtimedata, peak_rate, 'b-', linewidth=2)
-    ax3.plot(smtimedata[250:], b_rate_of_change, label='Scattering data', linewidth=2, alpha=0.4)
-    ax2.set_xlabel('Time (s))')
-else:
-    ax2.plot(timed_temp_data, peak_rate, 'b-', linewidth=2)
+ax2.plot(timed_temp_data, peak_rate, 'b-', linewidth=2)
+if use_channel_b:
     ax3.plot(timed_temp_data[250:], b_rate_of_change, label='Scattering data', linewidth=2, alpha=0.4)
-    ax2.set_xlabel('Temperature (°C)')
+ax2.set_xlabel('Temperature (°C)')
 ax2.set_ylabel('Peaks per degree')
 ax3.set_ylabel('Differential of scattering data')
 ax2.set_title('Peak Density (0.1°C window)')

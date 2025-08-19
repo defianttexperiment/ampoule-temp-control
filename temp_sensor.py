@@ -20,11 +20,11 @@ log_data_record_raw_data = True # Independent of smoothing interval, record raw 
 
 # Decides whether to run temperature control components
 run_slow_control = False # Runs voltage sweep
-run_pid_control = True # Runs PID controller
-run_pid_slow_control = False
-pid_desired_temp = 17.0
+run_pid_control = False # Runs PID controller
+run_pid_slow_control = True
+pid_desired_temp = 17.6
 pid_interval = 15
-pid_slow_control_starting_temp = 17.0
+pid_slow_control_starting_temp = 16.4
 pid_slow_control_ending_temp = 17.6
 pid_slow_control_voltage_finding_time = 225
 pid_slow_control_intermediate_settling_time = 0
@@ -40,7 +40,7 @@ ACTIVE_THERMOCOUPLES = {
 }
 
 # Active TSic sensors on LabJack (AIN channels)
-ACTIVE_TSIC_CHANNELS = [0]
+ACTIVE_TSIC_CHANNELS = [2]
 
 # ---------------- CODE PREPARATION ----------------
 # Ensures only one temperature control component runs at a time
@@ -228,8 +228,8 @@ def log_data(supply):
                     shared_data.update_current(supply_current)
 
                 # Update shared temperature data for other threads
-                if ACTIVE_TSIC_CHANNELS and 0 in ACTIVE_TSIC_CHANNELS:
-                    current_temp = avg_tsic[0]
+                if ACTIVE_TSIC_CHANNELS:
+                    current_temp = avg_tsic[ACTIVE_TSIC_CHANNELS[0]]
                     shared_data.update_temperature(current_temp, avg_thermo, avg_tsic)
 
                 for tc in ACTIVE_THERMOCOUPLES:
@@ -336,20 +336,13 @@ def voltage_lookup(input_temp):
 def slow_control(temp_step, supply):
     """Control thread that adjusts voltage based on current temperature."""
     print(f"Slow control thread started with temp_step={temp_step}")
-
-    # Connect to power supply (TURN OFF FOR OVERNIGHT)
-    supply.set_voltage(1.3)
-    time.sleep(300)
     
     while not exit_event.is_set():
-        for i in range(201):
-            voltage = 1.3 - 0.001*i
+        for i in range(1001):
+            voltage = 0.001*i
             print(f"Voltage set to {voltage}")
             supply.set_voltage(voltage)
-            time.sleep(10)
-        
-        supply.set_voltage(1.1)
-        time.sleep(300)
+            time.sleep(1)
 
 
         """
@@ -446,6 +439,10 @@ def pid_slow_control(interval, supply):
         previous_error = error
         correction = (P_out + I_out + D_out)*-1
         voltage = voltage + correction
+        if voltage < 0:
+            voltage = 0
+        if voltage > 2:
+            voltage = 2
         pid_voltage_archive.append(voltage)
         print(pid_voltage_archive)
         try:
@@ -493,19 +490,24 @@ def pid_slow_control(interval, supply):
             supply.set_voltage(voltage)
             time.sleep(pid_slow_control_swing_time/((starting_voltage-ending_voltage)*1000))
 
+    time.sleep(600)
+
 def pid_control(desired_temp, interval):
     """Control thread that adjusts voltage to match a given temperature."""
+
+    time.sleep(3)
+
+    previous_error = desired_temp - shared_data.get_avg_temperature()
 
     time.sleep(interval) # Ensures some temperature is available for measuring
 
     # Initial values
     current_temp = shared_data.get_avg_temperature()
     integral = 0
-    previous_error = 0
     voltage = supply.get_measured_voltage()
 
     # Hyperparameters for tuning. K_u = 1.84, T_u = 58.2, K_p = 0.2*K_u = 0.368, K_i = 0.40*K_u/T_u = 0.0127, k_d = 0.067*K_u*T_u = 7.17
-    k_prop = 0.368 # recommended: 0.368, prev: 0.15
+    k_prop = 0.2 # recommended: 0.368, prev: 0.15
     k_int = 0 # recommended: 0.0127
     k_deriv = 7.17 # recommended: 7.17, prev: 5
 
@@ -551,7 +553,7 @@ if __name__ == "__main__":
         handle = ljm.openS("T7", "ANY", "ANY")
         configure_thermocouple(handle)
         configure_tsic(handle)
-        supply = E3644A("/dev/tty.PL2303G-USBtoUART140")
+        supply = E3644A("/dev/tty.PL2303G-USBtoUART120")
 
         print(f"Starting live temperature monitoring... Data will be saved in {csv_filename}\n")
 

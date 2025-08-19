@@ -27,7 +27,7 @@ run_timeout = True # Determines whether to end program after a certain time peri
 timeout_length = 10800 # Timeout length in seconds; default 1800 = 30 minutes
 
 # Active TSic sensors on LabJack (AIN channels)
-ACTIVE_TSIC_CHANNELS = [0]
+ACTIVE_TSIC_CHANNELS = [2]
 
 # Generate timestamp in YYYY_MM_DD_HH_MM_SS format for filename
 timestamp = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
@@ -278,7 +278,7 @@ if __name__ == "__main__":
     try:
         handle = ljm.openS("T7", "ANY", "ANY")
         configure_thermocouple(handle)
-        supply = E3644A("/dev/tty.PL2303G-USBtoUART140")
+        supply = E3644A("/dev/tty.PL2303G-USBtoUART1220")
         # print(f"Connected to: {supply.identify()}")
 
         print(f"Starting live temperature monitoring... Data will be saved in {csv_filename}\n")
