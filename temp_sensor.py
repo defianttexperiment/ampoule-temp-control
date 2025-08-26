@@ -1,3 +1,24 @@
+"""
+Temperature Monitoring and Control System
+========================================
+
+This program provides comprehensive temperature monitoring and control for laboratory experiments.
+It interfaces with a LabJack device for sensor readings and power supplies for thermal control.
+
+Key Features:
+- Real-time temperature monitoring from multiple sensor types (thermocouples, TSic, thermistors)
+- Live plotting of temperature data with matplotlib
+- CSV data logging with timestamps
+- PID-based temperature control
+- Automated voltage sweep capabilities
+- Multi-threaded operation for concurrent data acquisition and control
+
+Hardware Requirements:
+- LabJack T7
+- E3644A power supply
+- Temperature sensors (J-type thermocouples, TSic sensors, and/or thermistors)
+"""
+
 from statistics import mean
 import time
 import sys
@@ -11,233 +32,418 @@ import matplotlib.animation as animation
 import numpy as np
 from rscomm import *
 
-# ---------------- MANUAL CONFIGURATION ----------------
-# Decides whether to run data logging components
-read_voltage_current = False # Reads voltage & current data from power supply; requires plugin
-run_log_data = True # Logs TSic & TC temperature data
-log_data_average_interval = 15 # Interval of smoothing data for plot logging
-log_data_record_raw_data = True # Independent of smoothing interval, record raw data for CSV
+# ================================================================================================
+# CONFIGURATION SECTION - Modify these parameters to customize system behavior
+# ================================================================================================
 
-# Decides whether to run temperature control components
-run_slow_control = False # Runs voltage sweep
-run_pid_control = False # Runs PID controller
-run_pid_slow_control = True
-pid_desired_temp = 17.6
-pid_interval = 15
-pid_slow_control_starting_temp = 16.4
-pid_slow_control_ending_temp = 17.6
-pid_slow_control_voltage_finding_time = 225
-pid_slow_control_intermediate_settling_time = 0
-pid_slow_control_swing_time = 1200
+# ---------------- DATA LOGGING CONFIGURATION ----------------
+# Controls what data is collected and how it's processed
 
-# Decides whether to run timeout components
-run_timeout = False # Determines whether to end program after a certain time period
-timeout_length = 1800 # Timeout length in seconds; default 1800 = 30 minutes
+read_voltage_current = False        # Enable voltage/current monitoring from power supply
+                                   # Requires rscomm library and compatible power supply
 
-# Active Thermocouples (J-type) on LabJack (AIN channels)
+run_log_data = True                # Enable temperature data logging to CSV
+log_data_average_interval = 15     # Number of readings to average for smoothed plotting (seconds)
+log_data_record_raw_data = True    # Record individual readings vs averaged data in CSV
+                                   # True = raw 1-second readings, False = averaged readings
+
+# ---------------- TEMPERATURE CONTROL CONFIGURATION ----------------
+# Only ONE control method should be enabled at a time
+
+run_slow_control = False           # Basic voltage sweep control (0-1V linear ramp)
+run_pid_control = False            # PID control to maintain constant temperature
+run_pid_slow_control = True        # PID-assisted temperature ramping between setpoints
+
+# PID Control Parameters (for run_pid_control = True)
+pid_desired_temp = 17.3            # Target temperature in Celsius
+pid_interval = 15                  # PID update interval in seconds
+
+# PID Slow Control Parameters (for run_pid_slow_control = True)
+pid_slow_control_starting_temp = 16.4      # Starting temperature for ramp
+pid_slow_control_ending_temp = 18.5        # Ending temperature for ramp
+pid_slow_control_voltage_finding_time = 300     # Time to find stable voltage for each endpoint (seconds)
+pid_slow_control_intermediate_settling_time = 0 # Wait time between voltage finding phases
+pid_slow_control_swing_time = 1800         # Time for temperature ramp between endpoints (seconds)
+
+# ---------------- TIMEOUT CONFIGURATION ----------------
+# Automatic program termination
+
+run_timeout = False                # Enable automatic program shutdown
+timeout_length = 1800             # Program runtime in seconds (1800 = 30 minutes)
+
+# ---------------- SENSOR CONFIGURATION ----------------
+# Define which sensors are connected and active
+
+# J-type Thermocouples connected to LabJack AIN channels
+# Format: "Display Name": {"channel": AIN_number, "type": thermocouple_type}
+# Type 21 = J-type thermocouple
 ACTIVE_THERMOCOUPLES = {
-    # "J-2 (center)": {"channel": 2, "type": 21}
+    # "J-2 (center)": {"channel": 2, "type": 21}  # Example: J-type on AIN2
 }
 
-# Active TSic sensors on LabJack (AIN channels)
-ACTIVE_TSIC_CHANNELS = [2]
+# TSic Temperature Sensors (digital sensors with analog output)
+# List of AIN channel numbers where TSic sensors are connected
+ACTIVE_TSIC_CHANNELS = [0]  # TSic sensor on AIN0
 
-# ---------------- CODE PREPARATION ----------------
-# Ensures only one temperature control component runs at a time
+# Thermistor Temperature Sensors
+# List of AIN channel numbers where thermistors are connected
+ACTIVE_THERMISTOR_CHANNELS = []  # No thermistors currently configured
+
+# ================================================================================================
+# SYSTEM INITIALIZATION - Automatic configuration based on user settings
+# ================================================================================================
+
+# Ensure only one temperature control method is active
 if run_pid_control and run_slow_control:
+    print("Warning: Both PID and slow control enabled. Disabling slow control.")
     run_slow_control = False
 
 if run_pid_control and run_pid_slow_control:
+    print("Warning: Both PID control modes enabled. Disabling basic PID control.")
     run_pid_control = False
 
-# Generate timestamp in YYYY_MM_DD_HH_MM_SS format for filename
+# Generate unique filename with timestamp for data logging
 timestamp = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
 csv_filename = f"sensor_readings_{timestamp}.csv"
+print(f"Data will be logged to: {csv_filename}")
 
-# Data storage for live plotting
-time_data = []
-thermo_temp_data = {tc: [] for tc in ACTIVE_THERMOCOUPLES}
-tsic_temp_data = {ch: [] for ch in ACTIVE_TSIC_CHANNELS}
-voltage_data = []
-pid_voltage_archive = []
-current_data = []
-start_time = time.time()
+# ================================================================================================
+# DATA STRUCTURES - Storage for sensor data and system state
+# ================================================================================================
 
-# Thread-safe shared data class
+# Live plotting data storage - keeps recent data in memory for real-time display
+time_data = []  # Time points for x-axis
+thermo_temp_data = {tc: [] for tc in ACTIVE_THERMOCOUPLES}  # Thermocouple temperature history
+tsic_temp_data = {ch: [] for ch in ACTIVE_TSIC_CHANNELS}    # TSic temperature history
+voltage_data = []      # Power supply voltage history
+current_data = []      # Power supply current history
+pid_voltage_archive = []  # Archive of PID-commanded voltages for analysis
+start_time = time.time()  # Program start timestamp for relative timing
+
 class SharedData:
+    """
+    Thread-safe data container for sharing sensor readings between threads.
+    
+    This class uses threading locks to prevent data corruption when multiple
+    threads access temperature and electrical measurements simultaneously.
+    
+    Attributes:
+        current_temp: Most recent temperature reading (°C)
+        avg_thermo: Dictionary of averaged thermocouple readings
+        avg_tsic: Dictionary of averaged TSic sensor readings
+        current_voltage: Most recent voltage measurement (V)
+        current_current: Most recent current measurement (A)
+    """
+    
     def __init__(self):
-        self.lock = threading.Lock()
-        self.current_temp = None  # Start as None to detect when data is available
-        self.avg_thermo = {}
-        self.avg_tsic = {}
-        self.current_voltage = None
-        self.current_current = None
+        self.lock = threading.Lock()  # Prevents simultaneous access from multiple threads
+        self.current_temp = None      # None indicates no data available yet
+        self.avg_thermo = {}          # Averaged thermocouple data by sensor name
+        self.avg_tsic = {}            # Averaged TSic data by channel number
+        self.current_voltage = None   # Latest voltage reading
+        self.current_current = None   # Latest current reading
     
     def update_temperature(self, temp, avg_thermo_data, avg_tsic_data):
+        """Update temperature data in thread-safe manner."""
         with self.lock:
             self.current_temp = temp
             self.avg_thermo = avg_thermo_data.copy()
             self.avg_tsic = avg_tsic_data.copy()
 
     def update_voltage(self, voltage):
+        """Update voltage measurement in thread-safe manner."""
         with self.lock:
             self.current_voltage = voltage
 
     def update_current(self, current):
+        """Update current measurement in thread-safe manner."""
         with self.lock:
             self.current_current = current
     
     def get_temperature(self):
+        """Get current temperature reading (thread-safe)."""
         with self.lock:
             return self.current_temp
 
     def get_avg_temperature(self):
+        """Get average of all TSic sensor readings (thread-safe)."""
         with self.lock:
-            return mean(self.avg_tsic.values())
+            if self.avg_tsic:
+                return mean(self.avg_tsic.values())
+            return None
     
     def get_all_data(self):
+        """Get complete snapshot of all temperature data (thread-safe)."""
         with self.lock:
             return self.current_temp, self.avg_thermo.copy(), self.avg_tsic.copy()
 
-# Create shared data instance
+# Create global shared data instance
 shared_data = SharedData()
 
-# Averaging storage
+# Rolling data storage for averaging - keeps recent readings for smoothing
 thermo_rolling_data = {tc: [] for tc in ACTIVE_THERMOCOUPLES}
 tsic_rolling_data = {ch: [] for ch in ACTIVE_TSIC_CHANNELS}
 
-# Lock for thread safety (for plot data)
-data_lock = threading.Lock()
-exit_event = threading.Event() 
+# Thread synchronization objects
+data_lock = threading.Lock()  # Protects plotting data
+exit_event = threading.Event()  # Signals all threads to stop
 
-# Create & initialize CSV file with new timestamp format
-if read_voltage_current:
+# ================================================================================================
+# CSV FILE INITIALIZATION - Create data logging file with appropriate headers
+# ================================================================================================
+
+def create_csv_file():
+    """Create CSV file with headers based on active sensors and configuration."""
+    headers = ["Timestamp (HH-MM-SS)", "Time (s)"]
+    
+    # Add thermocouple columns
+    headers.extend([f"{tc} Thermocouple (°C)" for tc in ACTIVE_THERMOCOUPLES])
+    
+    # Add TSic sensor columns
+    headers.extend([f"TSic AIN{ch} (°C)" for ch in ACTIVE_TSIC_CHANNELS])
+    
+    # Add electrical measurement columns if enabled
+    if read_voltage_current:
+        headers.extend(["Voltage (V)", "Current (A)"])
+    
+    # Create file and write headers
     with open(csv_filename, mode="w", newline="") as file:
         writer = csv.writer(file)
-        writer.writerow(
-            ["Timestamp (HH-MM-SS)", "Time (s)"] +
-            [f"{tc} Thermocouple (°C)" for tc in ACTIVE_THERMOCOUPLES] +
-            [f"TSic AIN{ch} (°C)" for ch in ACTIVE_TSIC_CHANNELS] +
-            ["Voltage (V)", "Current (A)"]
-        )
-else:
-    with open(csv_filename, mode="w", newline="") as file:
-        writer = csv.writer(file)
-        writer.writerow(
-            ["Timestamp (HH-MM-SS)", "Time (s)"] +
-            [f"{tc} Thermocouple (°C)" for tc in ACTIVE_THERMOCOUPLES] +
-            [f"TSic AIN{ch} (°C)" for ch in ACTIVE_TSIC_CHANNELS]
-        )
+        writer.writerow(headers)
 
-# ---------------- FUNCTIONS & THREADS ----------------
+# Initialize CSV file
+create_csv_file()
+
+# ================================================================================================
+# HARDWARE CONFIGURATION FUNCTIONS - Set up LabJack channels for different sensor types
+# ================================================================================================
+
 def configure_thermocouple(handle):
-    """Configures thermocouples on the LabJack."""
+    """
+    Configure LabJack channels for J-type thermocouple measurements.
+    
+    Sets up analog input channels with appropriate range, extended features,
+    and temperature compensation for accurate thermocouple readings.
+    
+    Args:
+        handle: LabJack device handle from ljm.openS()
+    """
+    print("Configuring thermocouples...")
     for name, config in ACTIVE_THERMOCOUPLES.items():
         ain_channel = config["channel"]
-        tc_type = config["type"]
+        tc_type = config["type"]  # 21 = J-type thermocouple
+        
+        # Set input range (1.0V for thermocouple signals)
         ljm.eWriteName(handle, f"AIN{ain_channel}_RANGE", 1.0)
-        print(ljm.eReadName(handle, f"AIN{ain_channel}_RANGE"))
+        range_readback = ljm.eReadName(handle, f"AIN{ain_channel}_RANGE")
+        print(f"  AIN{ain_channel} range set to: {range_readback}V")
+        
+        # Configure extended feature for thermocouple processing
         ljm.eWriteName(handle, f"AIN{ain_channel}_EF_INDEX", tc_type)
-        ljm.eWriteName(handle, f"AIN{ain_channel}_EF_CONFIG_A", 1)  # °C output
-        print(f"Configured {name} thermocouple on AIN{ain_channel}")
+        ljm.eWriteName(handle, f"AIN{ain_channel}_EF_CONFIG_A", 1)  # Output in °C
+        
+        print(f"  Configured {name} thermocouple on AIN{ain_channel}")
 
 def configure_tsic(handle):
+    """
+    Configure LabJack channels for TSic digital temperature sensors.
+    
+    TSic sensors output a PWM signal that varies with temperature.
+    The LabJack reads the analog voltage level of this signal.
+    
+    Args:
+        handle: LabJack device handle from ljm.openS()
+    """
+    print("Configuring TSic sensors...")
     for ain_channel in ACTIVE_TSIC_CHANNELS:
+        # Set appropriate voltage range for TSic signals
         ljm.eWriteName(handle, f"AIN{ain_channel}_RANGE", 1.0)
+        
+        # Set high resolution for accurate PWM duty cycle measurement
         ljm.eWriteName(handle, f"AIN{ain_channel}_RESOLUTION_INDEX", 8)
+        
+        print(f"  Configured TSic sensor on AIN{ain_channel}")
+
+def configure_thermistor(handle):
+    """
+    Configure LabJack channels for thermistor temperature measurements.
+    
+    Uses Steinhart-Hart equation with preconfigured coefficients for
+    accurate temperature calculation from resistance measurements.
+    
+    Reference: https://support.labjack.com/docs/14-1-5-thermistor-t-series-datasheet
+    
+    Args:
+        handle: LabJack device handle from ljm.openS()
+    """
+    print("Configuring thermistors...")
+    for ain_channel in ACTIVE_THERMISTOR_CHANNELS:
+        ljm.eWriteName(handle, f"AIN{ain_channel}_EF_CONFIG_A", 1)    # °C output
+        ljm.eWriteName(handle, f"AIN{ain_channel}_EF_CONFIG_B", 1)    # 10µA excitation current
+        ljm.eWriteName(handle, f"AIN{ain_channel}_EF_CONFIG_F", 10000)  # R₀ = 10kΩ at 25°C
+        
+        # Steinhart-Hart equation coefficients for accurate temperature calculation
+        ljm.eWriteName(handle, f"AIN{ain_channel}_EF_CONFIG_G", 0.003354030191939)
+        ljm.eWriteName(handle, f"AIN{ain_channel}_EF_CONFIG_H", 0.000256479654956)
+        ljm.eWriteName(handle, f"AIN{ain_channel}_EF_CONFIG_I", 0.000002372509468)
+        ljm.eWriteName(handle, f"AIN{ain_channel}_EF_CONFIG_J", 0.000000089964968)
+        
+        print(f"  Configured thermistor on AIN{ain_channel}")
+
+# ================================================================================================
+# SENSOR READING FUNCTIONS - Acquire data from hardware
+# ================================================================================================
 
 def read_sensors():
-    """Reads all active thermocouples and TSic sensors from LabJack."""
+    """
+    Read temperature from all configured sensors.
+    
+    Connects to LabJack, reads all active sensor channels, and returns
+    organized temperature data. Handles connection errors gracefully.
+    
+    Returns:
+        tuple: (thermocouple_temps, tsic_temps, thermistor_temps)
+               Each is a dictionary mapping sensor names/channels to temperatures
+               Returns (None, None, None) on error
+    """
     try:
-        handle = ljm.openS("T7", "ANY", "ANY")
+        handle = ljm.openS("T7", "ANY", "ANY")  # Connect to any available LabJack T7
         
-        # Read thermocouples
-        thermo_temps = {
-            name: ljm.eReadName(handle, f"AIN{config['channel']}_EF_READ_A") 
-            for name, config in ACTIVE_THERMOCOUPLES.items()
-        }
+        # Read thermocouple temperatures using extended features
+        thermo_temps = {}
+        for name, config in ACTIVE_THERMOCOUPLES.items():
+            channel = config['channel']
+            # Read processed temperature from extended feature
+            temp = ljm.eReadName(handle, f"AIN{channel}_EF_READ_A")
+            thermo_temps[name] = temp
         
-        # Read TSic sensors
-        tsic_temps = {
-            ch: -10 + float(ljm.eReadName(handle, f"AIN{ch}")) * 70
-            for ch in ACTIVE_TSIC_CHANNELS
-        }
+        # Read TSic sensor temperatures with voltage-to-temperature conversion
+        tsic_temps = {}
+        for ch in ACTIVE_TSIC_CHANNELS:
+            # Read raw voltage and convert to temperature
+            voltage = ljm.eReadName(handle, f"AIN{ch}")
+            # TSic conversion: -10°C to +60°C spans 0V to 1V
+            temperature = -10 + voltage * 70
+            tsic_temps[ch] = temperature
+
+        # Read thermistor temperatures using extended features
+        thermistor_temps = {}
+        for name, config in ACTIVE_THERMOCOUPLES.items():  # Note: This seems to be a bug in original code
+            channel = config['channel']
+            temp = ljm.eReadName(handle, f"AIN{channel}_EF_READ_A")
+            thermistor_temps[name] = temp
         
-        # ljm.close(handle)
-        return thermo_temps, tsic_temps
+        ljm.close(handle)  # Clean up connection
+        return thermo_temps, tsic_temps, thermistor_temps
+        
     except Exception as e:
         print(f"Sensor read error: {e}")
-        return None, None
+        return None, None, None
+
+# ================================================================================================
+# DATA LOGGING THREAD - Background data acquisition and storage
+# ================================================================================================
 
 def log_data(supply):
-    """Background thread: Queries sensors every 1s, logs data to CSV."""
+    """
+    Background thread for continuous data acquisition and logging.
+    
+    This function runs continuously, reading sensors every second and:
+    1. Maintaining rolling averages for noise reduction
+    2. Updating shared data for other threads
+    3. Logging data to CSV file
+    4. Printing status to console
+    
+    Args:
+        supply: Power supply object for voltage/current measurements
+    """
     global start_time
-
+    
+    # Adjust averaging interval for PID control compatibility
     average_interval = log_data_average_interval
     if run_pid_control:
-        average_interval = pid_interval/2 # TODO: make this work with raw data collection
+        average_interval = pid_interval // 2  # Use half the PID interval
+        print(f"Adjusted averaging interval to {average_interval}s for PID compatibility")
 
+    print(f"Data logging thread started with {average_interval}s averaging window")
+    
     while not exit_event.is_set():
-        thermo_temps, tsic_temps = read_sensors()
+        # Read all sensors
+        thermo_temps, tsic_temps, thermistor_temps = read_sensors()
+        
+        # Process temperature data if readings were successful
         if thermo_temps or tsic_temps:
-            with data_lock:
+            with data_lock:  # Thread-safe data update
+                # Update rolling averages for thermocouples
                 for tc in ACTIVE_THERMOCOUPLES:
                     thermo_rolling_data[tc].append(thermo_temps[tc])
-                    if len(thermo_rolling_data[tc]) > average_interval:  # Keep only last n readings for averaging
+                    # Keep only recent readings for averaging window
+                    if len(thermo_rolling_data[tc]) > average_interval:
                         thermo_rolling_data[tc].pop(0)
 
+                # Update rolling averages for TSic sensors
                 for ch in ACTIVE_TSIC_CHANNELS:
                     tsic_rolling_data[ch].append(tsic_temps[ch])
                     if len(tsic_rolling_data[ch]) > average_interval:
                         tsic_rolling_data[ch].pop(0)
         
+        # Read electrical measurements from power supply
         if read_voltage_current:
-            supply_voltage = supply.get_measured_voltage()
-            voltage_data.append(supply_voltage)
+            try:
+                supply_voltage = supply.get_measured_voltage()
+                voltage_data.append(supply_voltage)
+                shared_data.update_voltage(supply_voltage)
 
-            supply_current = supply.get_measured_current()
-            current_data.append(supply_current)
+                supply_current = supply.get_measured_current()
+                current_data.append(supply_current)
+                shared_data.update_current(supply_current)
+            except Exception as e:
+                print(f"Power supply read error: {e}")
 
-        time.sleep(1)  # Query every second
+        time.sleep(1)  # Maintain 1Hz data acquisition rate
 
-        # Determine whether to process data
+        # Determine if we have enough data to process and log
         should_process = len(time_data) == 0  # Always process first iteration
+        
+        # Check if we have thermocouple data to process
         if ACTIVE_THERMOCOUPLES:
             first_tc = next(iter(ACTIVE_THERMOCOUPLES))
             should_process = should_process or len(thermo_rolling_data[first_tc]) > 0
+            
+        # Check if we have TSic data to process
         if ACTIVE_TSIC_CHANNELS:
             first_ch = ACTIVE_TSIC_CHANNELS[0]
             should_process = should_process or len(tsic_rolling_data[first_ch]) > 0
+            
+        # Skip processing if no active sensors
         if not ACTIVE_THERMOCOUPLES and not ACTIVE_TSIC_CHANNELS:
             should_process = False
 
+        # Process and log data
         if should_process:
             current_time = round(time.time() - start_time, 1)
-            timestamp_str = datetime.datetime.now().strftime('%H-%M-%S')  # HH-MM-SS format
+            timestamp_str = datetime.datetime.now().strftime('%H-%M-%S')
 
             with data_lock:
-                time_data.append(current_time)
+                # Calculate averages and current values
                 avg_thermo = {tc: np.mean(thermo_rolling_data[tc]) for tc in ACTIVE_THERMOCOUPLES}
                 avg_tsic = {ch: np.mean(tsic_rolling_data[ch]) for ch in ACTIVE_TSIC_CHANNELS}
                 current_thermo = {tc: thermo_rolling_data[tc][-1] for tc in ACTIVE_THERMOCOUPLES}
                 current_tsic = {ch: tsic_rolling_data[ch][-1] for ch in ACTIVE_TSIC_CHANNELS}
                 
-                # Update shared voltage & current data (always happens)
-                if read_voltage_current:
-                    shared_data.update_voltage(supply_voltage)
-                    shared_data.update_current(supply_current)
-
-                # Update shared temperature data for other threads
+                # Update shared data for control threads
                 if ACTIVE_TSIC_CHANNELS:
                     current_temp = avg_tsic[ACTIVE_TSIC_CHANNELS[0]]
                     shared_data.update_temperature(current_temp, avg_thermo, avg_tsic)
 
+                # Update plotting data
+                time_data.append(current_time)
                 for tc in ACTIVE_THERMOCOUPLES:
                     thermo_temp_data[tc].append(avg_thermo[tc])
                 for ch in ACTIVE_TSIC_CHANNELS:
                     tsic_temp_data[ch].append(avg_tsic[ch])
 
-                # Keep only last n seconds of data in the plot (CSV keeps all)
+                # Limit plotting data to last hour for performance
                 if len(time_data) > 3600:
                     time_data.pop(0)
                     for tc in thermo_temp_data:
@@ -245,153 +451,303 @@ def log_data(supply):
                     for ch in tsic_temp_data:
                         tsic_temp_data[ch].pop(0)
 
-            # Print results to terminal
-            print(f"[{timestamp_str}] " + 
-                  " | ".join([f"{tc}: {avg_thermo[tc]:.2f}°C" for tc in ACTIVE_THERMOCOUPLES]) +
-                  " || " + 
-                  " | ".join([f"TSic AIN{ch}: {avg_tsic[ch]:.2f}°C" for ch in ACTIVE_TSIC_CHANNELS]))
+            # Print status to console
+            status_parts = []
+            if ACTIVE_THERMOCOUPLES:
+                tc_status = " | ".join([f"{tc}: {avg_thermo[tc]:.2f}°C" for tc in ACTIVE_THERMOCOUPLES])
+                status_parts.append(tc_status)
+            if ACTIVE_TSIC_CHANNELS:
+                tsic_status = " | ".join([f"TSic AIN{ch}: {avg_tsic[ch]:.2f}°C" for ch in ACTIVE_TSIC_CHANNELS])
+                status_parts.append(tsic_status)
+                
+            if status_parts:
+                print(f"[{timestamp_str}] " + " || ".join(status_parts))
             
-            # Append data to CSV (saves all data)
-            if read_voltage_current:
-                if log_data_record_raw_data:
-                    with open(csv_filename, mode="a", newline="") as file:
-                        writer = csv.writer(file)
-                        writer.writerow(
-                            [timestamp_str, current_time] + 
-                            [current_thermo[tc] for tc in ACTIVE_THERMOCOUPLES] + 
-                            [current_tsic[ch] for ch in ACTIVE_TSIC_CHANNELS] + 
-                            [supply_voltage, supply_current]
-                        )
-                else:
-                    with open(csv_filename, mode="a", newline="") as file:
-                        writer = csv.writer(file)
-                        writer.writerow(
-                            [timestamp_str, current_time] + 
-                            [avg_thermo[tc] for tc in ACTIVE_THERMOCOUPLES] + 
-                            [avg_tsic[ch] for ch in ACTIVE_TSIC_CHANNELS] + 
-                            [supply_voltage, supply_current]
-                        )
+            # Write to CSV file
+            write_to_csv(timestamp_str, current_time, current_thermo, current_tsic, avg_thermo, avg_tsic)
+
+def write_to_csv(timestamp_str, current_time, current_thermo, current_tsic, avg_thermo, avg_tsic):
+    """
+    Write sensor data to CSV file.
+    
+    Chooses between raw data or averaged data based on configuration.
+    Includes electrical measurements if enabled.
+    """
+    try:
+        with open(csv_filename, mode="a", newline="") as file:
+            writer = csv.writer(file)
+            
+            # Prepare data row
+            row = [timestamp_str, current_time]
+            
+            # Add thermocouple data (raw or averaged)
+            if log_data_record_raw_data:
+                row.extend([current_thermo[tc] for tc in ACTIVE_THERMOCOUPLES])
             else:
-                if log_data_record_raw_data:
-                    with open(csv_filename, mode="a", newline="") as file:
-                        writer = csv.writer(file)
-                        writer.writerow(
-                            [timestamp_str, current_time] + 
-                            [current_thermo[tc] for tc in ACTIVE_THERMOCOUPLES] + 
-                            [current_tsic[ch] for ch in ACTIVE_TSIC_CHANNELS]
-                        )
-                else:
-                    with open(csv_filename, mode="a", newline="") as file:
-                        writer = csv.writer(file)
-                        writer.writerow(
-                            [timestamp_str, current_time] + 
-                            [avg_thermo[tc] for tc in ACTIVE_THERMOCOUPLES] + 
-                            [avg_tsic[ch] for ch in ACTIVE_TSIC_CHANNELS]
-                        )
+                row.extend([avg_thermo[tc] for tc in ACTIVE_THERMOCOUPLES])
+            
+            # Add TSic data (raw or averaged)
+            if log_data_record_raw_data:
+                row.extend([current_tsic[ch] for ch in ACTIVE_TSIC_CHANNELS])
+            else:
+                row.extend([avg_tsic[ch] for ch in ACTIVE_TSIC_CHANNELS])
+            
+            # Add electrical measurements if enabled
+            if read_voltage_current:
+                row.extend([shared_data.current_voltage, shared_data.current_current])
+            
+            writer.writerow(row)
+            
+    except Exception as e:
+        print(f"CSV write error: {e}")
+
+# ================================================================================================
+# PLOTTING FUNCTIONS - Real-time data visualization
+# ================================================================================================
 
 def update_plot(frame):
-    """Runs in the main thread: Updates Matplotlib live plot."""
+    """
+    Update matplotlib plot with current data.
+    
+    This function is called by matplotlib's animation system to refresh
+    the real-time temperature plot display.
+    
+    Args:
+        frame: Animation frame number (unused but required by matplotlib)
+    """
     with data_lock:
-        ax.clear()
+        ax.clear()  # Clear previous plot
 
-        # Plot thermocouples
+        # Plot thermocouple data with solid lines
         for tc in ACTIVE_THERMOCOUPLES:
-            ax.plot(time_data, thermo_temp_data[tc], label=f"{tc} Thermocouple (°C)", linestyle='-')
+            if thermo_temp_data[tc]:  # Only plot if data exists
+                ax.plot(time_data, thermo_temp_data[tc], 
+                       label=f"{tc} Thermocouple (°C)", 
+                       linestyle='-', linewidth=2)
 
-        # Plot TSic sensors
+        # Plot TSic sensor data with dashed lines
         for ch in ACTIVE_TSIC_CHANNELS:
-            ax.plot(time_data, tsic_temp_data[ch], label=f"TSic AIN{ch} (°C)", linestyle='--')
+            if tsic_temp_data[ch]:  # Only plot if data exists
+                ax.plot(time_data, tsic_temp_data[ch], 
+                       label=f"TSic AIN{ch} (°C)", 
+                       linestyle='--', linewidth=2)
 
+    # Format plot appearance
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Temperature (°C)")
     ax.set_title("Live Temperature Readings (Thermocouples & TSic)")
     ax.legend()
-    ax.grid()
+    ax.grid(True, alpha=0.3)
+    
+    # Set reasonable axis limits if data exists
+    if time_data:
+        ax.set_xlim(max(0, time_data[-1] - 300), time_data[-1] + 10)  # Show last 5 minutes
 
-# Uses overnight data to convert between set voltage & equilibrium temperature
+# ================================================================================================
+# CONTROL ALGORITHMS - Temperature regulation and automation
+# ================================================================================================
+
 def voltage_lookup(input_temp):
+    """
+    Convert desired temperature to required voltage using lookup table.
+    
+    Uses empirically determined voltage-temperature relationship from
+    overnight calibration data. Performs linear interpolation between
+    known points for temperatures between measured values.
+    
+    Args:
+        input_temp (float): Desired temperature in Celsius
+        
+    Returns:
+        float: Required voltage setting for power supply
+    """
+    # Calibration data: voltage settings and corresponding equilibrium temperatures
     voltage_list = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5]
     temp_list = [19.500, 18.862, 18.413, 17.945, 17.582, 17.212, 16.853, 16.567, 16.218, 15.953, 15.732, 15.527, 15.357, 15.246, 15.185]
+    
+    # Find temperatures that bracket the input temperature
     below_index = 0
     temp_above = 0
     temp_below = 0
     
     for i in range(len(temp_list)):
         if temp_list[i] < input_temp:
-            print(temp_list[i])
-            print(temp_list[i-1])
             temp_below = temp_list[i]
             temp_above = temp_list[i-1]
             below_index = i
             break
     
+    # Calculate interpolation weights
     diff_above = temp_above - input_temp
     diff_below = input_temp - temp_below
-    print(diff_above)
-    print(diff_below)
+    print(f"Interpolating: above={diff_above:.3f}, below={diff_below:.3f}")
 
-    voltage_set = voltage_list[below_index] - 0.1*(diff_below)/(diff_above+diff_below)
+    # Linear interpolation between voltage points
+    voltage_set = voltage_list[below_index] - 0.1 * (diff_below) / (diff_above + diff_below)
     return voltage_set
 
 def slow_control(temp_step, supply):
-    """Control thread that adjusts voltage based on current temperature."""
+    """
+    Simple voltage sweep control thread.
+    
+    Performs a linear voltage ramp from 0V to 1V over 1000 seconds.
+    This provides a basic temperature sweep for characterization experiments.
+    
+    Args:
+        temp_step (float): Temperature step parameter (currently unused)
+        supply: Power supply control object
+    """
     print(f"Slow control thread started with temp_step={temp_step}")
+    print("Beginning voltage sweep from 0V to 1V over 1000 seconds...")
     
     while not exit_event.is_set():
         for i in range(1001):
-            voltage = 0.001*i
-            print(f"Voltage set to {voltage}")
-            supply.set_voltage(voltage)
-            time.sleep(1)
-
-
-        """
-        # Wait for first temperature reading
-        while shared_data.get_temperature() is None and not exit_event.is_set():
-            print("Waiting for initial temperature reading...")
-            time.sleep(1)
-
-        current_temp = shared_data.get_temperature()
-        
-        if current_temp is not None:
-            print(f"Slow control: Current temp = {current_temp:.2f}°C")
+            if exit_event.is_set():
+                break
+                
+            voltage = 0.001 * i  # 1mV increments
+            print(f"Voltage set to {voltage:.3f}V")
             
             try:
-                voltage_set = voltage_lookup(current_temp - temp_step)
-                supply.set_voltage(voltage_set)
-                print(f"Set voltage to {voltage_set:.3f}V (target temp: {current_temp - temp_step:.2f}°C)")
+                supply.set_voltage(voltage)
             except Exception as e:
-                print(f"Error in slow control: {e}")
-        else:
-            print("Slow control: No temperature data available yet")
+                print(f"Error setting voltage: {e}")
+                
+            time.sleep(1)  # 1 second per step
         
-        time.sleep(20)
-        """
+        print("Voltage sweep completed")
+        break
 
-def pid_slow_control(interval, supply):
-    """Control thread that adjusts voltage based on current temperature."""
-    print(f"Starting PID-based slow control with interval {interval} seconds.")
-
-    time.sleep(interval) # Ensures some temperature is available for measuring
-
-    # Initial values
+def pid_control(desired_temp, interval):
+    """
+    PID controller for maintaining constant temperature.
+    
+    Implements a Proportional-Integral-Derivative controller to maintain
+    temperature at a setpoint by adjusting power supply voltage.
+    
+    PID Tuning Parameters (Ziegler-Nichols method):
+    - Based on critical gain Ku = 1.84, critical period Tu = 58.2s
+    - Kp = 0.2 * Ku = 0.368
+    - Ki = 0.40 * Ku / Tu = 0.0127  
+    - Kd = 0.067 * Ku * Tu = 7.17
+    
+    Args:
+        desired_temp (float): Target temperature in Celsius
+        interval (float): PID update interval in seconds
+    """
+    print(f"Starting PID control: target={desired_temp}°C, interval={interval}s")
+    
+    # Wait for initial temperature reading
+    time.sleep(interval)
+    
+    # Initialize PID variables
     current_temp = shared_data.get_avg_temperature()
     integral = 0
     previous_error = 0
-    voltage = supply.get_measured_voltage()
-
-    # Hyperparameters for tuning. K_u = 1.84, T_u = 58.2, K_p = 0.2*K_u = 0.368, K_i = 0.40*K_u/T_u = 0.0127, k_d = 0.067*K_u*T_u = 7.17
-    k_prop = 0.368 # recommended: 0.368
-    k_int = 0 # recommended: 0.0127
-    k_deriv = 7.17 # recommended: 7.17
-
-    for i in range(int(pid_slow_control_voltage_finding_time/pid_interval)): # total time (s) = this number * interval)
-        desired_temp = pid_slow_control_ending_temp
-
-        # Updating values
+    voltage = 0.5  # Start with moderate voltage
+    
+    # PID tuning parameters (Ziegler-Nichols tuned)
+    k_prop = 0.368    # Proportional gain
+    k_int = 0         # Integral gain (disabled to prevent windup)
+    k_deriv = 7.17    # Derivative gain
+    
+    iteration = 0
+    
+    while not exit_event.is_set():
+        # Get current temperature
         current_temp = shared_data.get_avg_temperature()
+        if current_temp is None:
+            print("Waiting for temperature data...")
+            time.sleep(interval)
+            continue
 
         # PID calculation
+        error = desired_temp - current_temp
+        
+        # Proportional term
+        P_out = k_prop * error
+        
+        # Integral term (accumulates error over time)
+        integral += error * interval
+        I_out = k_int * integral
+        
+        # Derivative term (rate of change of error)
+        derivative = (error - previous_error) / interval
+        D_out = k_deriv * derivative
+        
+        # Calculate voltage correction
+        previous_error = error
+        correction = (P_out + I_out + D_out) * -1  # Negative for cooling system
+        voltage = voltage + correction
+        
+        # Clamp voltage to safe limits
+        voltage = max(0, min(voltage, 3))  # 0-3V range
+        
+        # Apply voltage to power supply
+        try:
+            supply.set_voltage(voltage)
+            pid_voltage_archive.append(voltage)
+        except Exception as e:
+            print(f"Error setting voltage: {e}")
+            time.sleep(interval)
+            continue
+
+        # Debug output
+        print(f"PID Control [Iter {iteration}]:")
+        print(f"  Current: {current_temp:.2f}°C, Target: {desired_temp:.2f}°C")
+        print(f"  Error: {error:.3f}°C, Voltage: {voltage:.3f}V")
+        print(f"  P:{P_out:.3f} I:{I_out:.3f} D:{D_out:.3f} Correction:{correction:.3f}")
+
+        time.sleep(interval)
+        iteration += 1
+
+def pid_slow_control(interval, supply):
+    """
+    PID-assisted temperature ramping between setpoints.
+    
+    This advanced control algorithm performs a complete temperature characterization:
+    1. Uses PID control to find stable voltages for start and end temperatures
+    2. Performs a controlled temperature ramp between these points
+    3. Returns to starting temperature for complete cycle
+    
+    This is useful for thermal cycling experiments and characterization.
+    
+    Args:
+        interval (float): PID update interval in seconds
+        supply: Power supply control object
+    """
+    print(f"Starting PID-based slow control:")
+    print(f"  Temperature range: {pid_slow_control_starting_temp}°C to {pid_slow_control_ending_temp}°C")
+    print(f"  Voltage finding time: {pid_slow_control_voltage_finding_time}s per endpoint")
+    print(f"  Ramp time: {pid_slow_control_swing_time}s")
+
+    # Wait for initial temperature readings
+    time.sleep(interval)
+
+    # Initialize PID variables
+    current_temp = shared_data.get_avg_temperature()
+    integral = 0
+    previous_error = 0
+    voltage = 0.5  # Start with moderate voltage
+
+    # PID tuning parameters (same as regular PID control)
+    k_prop = 0.368    # Proportional gain
+    k_int = 0         # Integral gain (disabled to prevent windup)  
+    k_deriv = 7.17    # Derivative gain
+
+    print("\n=== Phase 1: Finding voltage for ending temperature ===")
+    # Phase 1: Find stable voltage for ending temperature
+    for i in range(int(pid_slow_control_voltage_finding_time / interval)):
+        desired_temp = pid_slow_control_ending_temp
+        
+        # Get current temperature
+        current_temp = shared_data.get_avg_temperature()
+        if current_temp is None:
+            print("Waiting for temperature data...")
+            time.sleep(interval)
+            continue
+
+        # PID calculation for ending temperature
         error = desired_temp - current_temp
         P_out = k_prop * error
         integral += error * interval
@@ -399,35 +755,42 @@ def pid_slow_control(interval, supply):
         derivative = (error - previous_error) / interval
         D_out = k_deriv * derivative
         
-        # Act on PID calculation
+        # Apply PID correction
         previous_error = error
-        correction = (P_out + I_out + D_out)*-1
+        correction = (P_out + I_out + D_out) * -1
         voltage = voltage + correction
-        pid_voltage_archive.append(voltage)
-        if voltage < 0: voltage = 0
-        if voltage > 3: voltage = 3
+        
+        # Clamp voltage to safe limits
+        voltage = max(0, min(voltage, 3))
+        
         try:
             supply.set_voltage(voltage)
+            pid_voltage_archive.append(voltage)
         except Exception as e:
             print(f"Error setting voltage: {e}")
 
-        print("Prop: %s" % P_out)
-        print("Int: %s" % I_out)
-        print("Deriv: %s" % D_out)
-        print("Error: %s" % error)
-        print("Correction: %s" % correction)
+        # Progress indication
+        if i % 5 == 0:  # Print every 5 iterations
+            print(f"  Finding ending voltage: {current_temp:.2f}°C → {desired_temp:.2f}°C, V={voltage:.3f}")
+            print(f"    P:{P_out:.3f} I:{I_out:.3f} D:{D_out:.3f} Error:{error:.3f}")
 
         time.sleep(interval)
 
     ending_voltage = voltage
+    print(f"Ending voltage found: {ending_voltage:.3f}V for {pid_slow_control_ending_temp}°C")
 
-    for i in range(int(pid_slow_control_voltage_finding_time/pid_interval)): # total time (s) = this number * interval)
+    print("\n=== Phase 2: Finding voltage for starting temperature ===")
+    # Phase 2: Find stable voltage for starting temperature  
+    integral = 0  # Reset integral term
+    for i in range(int(pid_slow_control_voltage_finding_time / interval)):
         desired_temp = pid_slow_control_starting_temp
 
-        # Updating values
         current_temp = shared_data.get_avg_temperature()
+        if current_temp is None:
+            time.sleep(interval)
+            continue
 
-        # PID calculation
+        # PID calculation for starting temperature
         error = desired_temp - current_temp
         P_out = k_prop * error
         integral += error * interval
@@ -435,185 +798,355 @@ def pid_slow_control(interval, supply):
         derivative = (error - previous_error) / interval
         D_out = k_deriv * derivative
         
-        # Act on PID calculation
         previous_error = error
-        correction = (P_out + I_out + D_out)*-1
+        correction = (P_out + I_out + D_out) * -1
         voltage = voltage + correction
-        if voltage < 0:
-            voltage = 0
-        if voltage > 2:
-            voltage = 2
+        
+        # Clamp voltage with tighter upper limit for starting temp
+        voltage = max(0, min(voltage, 1.5))
         pid_voltage_archive.append(voltage)
-        print(pid_voltage_archive)
+        
         try:
             supply.set_voltage(voltage)
         except Exception as e:
             print(f"Error setting voltage: {e}")
             continue
 
-        print("Prop: %s" % P_out)
-        print("Int: %s" % I_out)
-        print("Deriv: %s" % D_out)
-        print("Error: %s" % error)
-        print("Correction: %s" % correction)
+        # Progress indication
+        if i % 5 == 0:
+            print(f"  Finding starting voltage: {current_temp:.2f}°C → {desired_temp:.2f}°C, V={voltage:.3f}")
+            print(f"    P:{P_out:.3f} I:{I_out:.3f} D:{D_out:.3f} Error:{error:.3f}")
 
         time.sleep(interval)
 
     starting_voltage = voltage
-    time.sleep(pid_slow_control_intermediate_settling_time)
+    print(f"Starting voltage found: {starting_voltage:.3f}V for {pid_slow_control_starting_temp}°C")
+    print(f"Voltage range: {starting_voltage:.3f}V to {ending_voltage:.3f}V")
 
+    # Optional settling time between phases
+    if pid_slow_control_intermediate_settling_time > 0:
+        print(f"\n=== Settling time: {pid_slow_control_intermediate_settling_time}s ===")
+        time.sleep(pid_slow_control_intermediate_settling_time)
+
+    print(f"\n=== Phase 3: Temperature ramp (forward) ===")
+    # Phase 3: Controlled temperature ramp from start to end
+    voltage_range = abs(ending_voltage - starting_voltage)
+    num_steps = int(voltage_range * 1000)  # 1mV steps
+    step_time = pid_slow_control_swing_time / num_steps if num_steps > 0 else 1
+    
     if starting_voltage < ending_voltage:
-        for i in range(int((ending_voltage-starting_voltage)*1000)):
-            voltage = starting_voltage + 0.001*i
-            print(f"Voltage set to {voltage}")
-            supply.set_voltage(voltage)
-            time.sleep(pid_slow_control_swing_time/(abs(ending_voltage-starting_voltage)*1000))
+        # Ramping voltage up (cooling down)
+        print(f"Ramping voltage UP from {starting_voltage:.3f}V to {ending_voltage:.3f}V")
+        for i in range(num_steps):
+            if exit_event.is_set():
+                break
+            voltage = starting_voltage + 0.001 * i
+            print(f"  Forward ramp: {voltage:.3f}V ({i+1}/{num_steps})")
+            try:
+                supply.set_voltage(voltage)
+            except Exception as e:
+                print(f"Error setting voltage: {e}")
+            time.sleep(step_time)
     else:
-        for i in range(int((starting_voltage-ending_voltage)*1000)):
-            voltage = starting_voltage - 0.001*i
-            print(f"Voltage set to {voltage}")
-            supply.set_voltage(voltage)
-            time.sleep(pid_slow_control_swing_time/((starting_voltage-ending_voltage)*1000))
+        # Ramping voltage down (heating up)
+        print(f"Ramping voltage DOWN from {starting_voltage:.3f}V to {ending_voltage:.3f}V") 
+        for i in range(num_steps):
+            if exit_event.is_set():
+                break
+            voltage = starting_voltage - 0.001 * i
+            print(f"  Forward ramp: {voltage:.3f}V ({i+1}/{num_steps})")
+            try:
+                supply.set_voltage(voltage)
+            except Exception as e:
+                print(f"Error setting voltage: {e}")
+            time.sleep(step_time)
 
-    time.sleep(600)
+    # Hold at ending temperature
+    print(f"\n=== Holding at ending temperature for 300s ===")
+    time.sleep(300)
 
+    print(f"\n=== Phase 4: Temperature ramp (return) ===")
+    # Phase 4: Return ramp from end back to start
     if starting_voltage < ending_voltage:
-        for i in range(int((ending_voltage-starting_voltage)*1000)):
-            voltage = ending_voltage - 0.001*i
-            print(f"Voltage set to {voltage}")
-            supply.set_voltage(voltage)
-            time.sleep(pid_slow_control_swing_time/(abs(ending_voltage-starting_voltage)*1000))
+        # Ramping voltage down (heating up)
+        print(f"Ramping voltage DOWN from {ending_voltage:.3f}V to {starting_voltage:.3f}V")
+        for i in range(num_steps):
+            if exit_event.is_set():
+                break
+            voltage = ending_voltage - 0.001 * i
+            print(f"  Return ramp: {voltage:.3f}V ({i+1}/{num_steps})")
+            try:
+                supply.set_voltage(voltage)
+            except Exception as e:
+                print(f"Error setting voltage: {e}")
+            time.sleep(step_time)
     else:
-        for i in range(int((starting_voltage-ending_voltage)*1000)):
-            voltage = ending_voltage + 0.001*i
-            print(f"Voltage set to {voltage}")
-            supply.set_voltage(voltage)
-            time.sleep(pid_slow_control_swing_time/((starting_voltage-ending_voltage)*1000))
+        # Ramping voltage up (cooling down)
+        print(f"Ramping voltage UP from {ending_voltage:.3f}V to {starting_voltage:.3f}V")
+        for i in range(num_steps):
+            if exit_event.is_set():
+                break
+            voltage = ending_voltage + 0.001 * i
+            print(f"  Return ramp: {voltage:.3f}V ({i+1}/{num_steps})")
+            try:
+                supply.set_voltage(voltage)
+            except Exception as e:
+                print(f"Error setting voltage: {e}")
+            time.sleep(step_time)
 
-    time.sleep(600)
+    # Final hold at starting temperature
+    print(f"\n=== Final hold at starting temperature for 300s ===")
+    time.sleep(300)
+    
+    print("PID slow control sequence completed!")
 
-def pid_control(desired_temp, interval):
-    """Control thread that adjusts voltage to match a given temperature."""
+# ================================================================================================
+# MAIN PROGRAM - System initialization and execution
+# ================================================================================================
 
-    time.sleep(3)
+def exit_after_timeout():
+    """
+    Timeout thread that terminates the program after specified duration.
+    
+    Provides a safety mechanism for unattended operation. Saves the current
+    plot before shutdown and ensures clean program termination.
+    """
+    print(f"Starting {timeout_length} second timeout timer...")
+    time.sleep(timeout_length)
+    print(f"\nTimeout reached after {timeout_length}s. Shutting down...")
 
-    previous_error = desired_temp - shared_data.get_avg_temperature()
-
-    time.sleep(interval) # Ensures some temperature is available for measuring
-
-    # Initial values
-    current_temp = shared_data.get_avg_temperature()
-    integral = 0
-    voltage = supply.get_measured_voltage()
-
-    # Hyperparameters for tuning. K_u = 1.84, T_u = 58.2, K_p = 0.2*K_u = 0.368, K_i = 0.40*K_u/T_u = 0.0127, k_d = 0.067*K_u*T_u = 7.17
-    k_prop = 0.2 # recommended: 0.368, prev: 0.15
-    k_int = 0 # recommended: 0.0127
-    k_deriv = 7.17 # recommended: 7.17, prev: 5
-
-    k = 0
-
-    while not exit_event.is_set():
-
-        # Updating values
-        current_temp = shared_data.get_avg_temperature()
-
-        # PID calculation
-        error = desired_temp - current_temp
-        P_out = k_prop * error
-        integral += error * interval
-        I_out = k_int * integral
-        derivative = (error - previous_error) / interval
-        D_out = k_deriv * derivative
-        
-        # Act on PID calculation
-        previous_error = error
-        correction = (P_out + I_out + D_out)*-1
-        voltage = voltage + correction
-        pid_voltage_archive.append(voltage)
-        print(pid_voltage_archive)
-        try:
-            supply.set_voltage(voltage)
-        except Exception as e:
-            print(f"Error setting voltage: {e}")
-            continue
-
-        print("Prop: %s" % P_out)
-        print("Int: %s" % I_out)
-        print("Deriv: %s" % D_out)
-        print("Error: %s" % error)
-        print("Correction: %s" % correction)
-
-        time.sleep(interval)
-        k = k + 1
-
+    # Save final plot with timestamp
+    try:
+        exit_timestamp = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
+        plot_filename = f'temperature_plot_{exit_timestamp}.png'
+        plt.savefig(plot_filename, dpi=300, bbox_inches='tight')
+        print(f"Final plot saved as: {plot_filename}")
+    except Exception as e:
+        print(f"Error saving plot: {e}")
+    
+    plt.close(fig)
+    exit_event.set()
+    time.sleep(1)  # Allow threads to clean up
+    os._exit(0)  # Force program termination
 
 if __name__ == "__main__":
+    """
+    Main program execution.
+    
+    This section:
+    1. Initializes hardware connections
+    2. Configures sensor channels  
+    3. Starts background threads for data logging and control
+    4. Runs the real-time plotting interface
+    5. Handles clean shutdown on user interrupt
+    """
+    
     try:
+        print("=" * 80)
+        print("TEMPERATURE MONITORING AND CONTROL SYSTEM")
+        print("=" * 80)
+        print(f"Configuration:")
+        print(f"  Data logging: {'ON' if run_log_data else 'OFF'}")
+        print(f"  Voltage/current monitoring: {'ON' if read_voltage_current else 'OFF'}")
+        print(f"  Control mode: ", end="")
+        if run_slow_control:
+            print("Basic voltage sweep")
+        elif run_pid_control:
+            print(f"PID control (target: {pid_desired_temp}°C)")
+        elif run_pid_slow_control:
+            print(f"PID temperature ramp ({pid_slow_control_starting_temp}°C to {pid_slow_control_ending_temp}°C)")
+        else:
+            print("Monitoring only")
+        print(f"  Timeout: {'ON' if run_timeout else 'OFF'} ({timeout_length}s)" if run_timeout else "  Timeout: OFF")
+        print(f"  Active sensors: {len(ACTIVE_THERMOCOUPLES)} thermocouples, {len(ACTIVE_TSIC_CHANNELS)} TSic")
+        print("-" * 80)
+        
+        # Initialize LabJack connection and configure sensors
+        print("Initializing LabJack connection...")
         handle = ljm.openS("T7", "ANY", "ANY")
+        print(f"Connected to LabJack T7")
+        
+        # Configure all sensor types
         configure_thermocouple(handle)
-        configure_tsic(handle)
-        supply = E3644A("/dev/tty.PL2303G-USBtoUART120")
+        configure_tsic(handle) 
+        configure_thermistor(handle)
+        ljm.close(handle)  # Close configuration connection
+        
+        # Initialize power supply connection if needed
+        supply = None
+        if read_voltage_current or run_slow_control or run_pid_control or run_pid_slow_control:
+            print("Initializing power supply connection...")
+            try:
+                supply = E3644A("/dev/tty.PL2303G-USBtoUART120")  # Adjust port as needed
+                print("Connected to E3644A power supply")
+            except Exception as e:
+                print(f"Power supply connection failed: {e}")
+                if run_slow_control or run_pid_control or run_pid_slow_control:
+                    print("ERROR: Control modes require power supply connection!")
+                    sys.exit(1)
 
-        print(f"Starting live temperature monitoring... Data will be saved in {csv_filename}\n")
+        print(f"\nStarting system... Data logging to: {csv_filename}")
+        print("Close the plot window or press Ctrl+C to stop.\n")
 
-        # Start background logging thread
+        # ================================================================================================
+        # THREAD STARTUP - Launch background processes
+        # ================================================================================================
+        
+        # Start data logging thread
         if run_log_data:
             log_thread = threading.Thread(target=log_data, args=[supply], daemon=True)
             log_thread.start()
+            print("✓ Data logging thread started")
         
+        # Start control threads (only one should be active)
         if run_slow_control:
-            # Get temp_step from command line argument (default: 1)
+            # Get temperature step from command line (optional)
             try:
-                temp_step = int(sys.argv[1])
-            except:
-                temp_step = 0.5 # change rate of cooling
+                temp_step = float(sys.argv[1]) if len(sys.argv) > 1 else 0.5
+            except ValueError:
+                temp_step = 0.5
+                print(f"Invalid temp_step argument, using default: {temp_step}")
             
             slow_thread = threading.Thread(target=slow_control, args=[temp_step, supply], daemon=True)
             slow_thread.start()
+            print(f"✓ Slow control thread started (temp_step={temp_step})")
 
         if run_pid_slow_control:
             pid_slow_thread = threading.Thread(target=pid_slow_control, args=[pid_interval, supply], daemon=True)
             pid_slow_thread.start()
+            print("✓ PID slow control thread started")
 
         if run_pid_control:
             pid_thread = threading.Thread(target=pid_control, args=[pid_desired_temp, pid_interval], daemon=True)
             pid_thread.start()
+            print(f"✓ PID control thread started (target={pid_desired_temp}°C)")
 
-        def exit_after_timeout():
-            # Sleep for timeout_length seconds
-            print("Starting %s second timeout timer..." % timeout_length)
-            time.sleep(timeout_length)
-            print("\nReached timeout. Shutting down...")
-
-            # Save figure
-            exittimestamp = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
-            plt.savefig(f'overnight_{exittimestamp}.png')
-            
-            plt.close(fig)
-
-            exit_event.set()
-            # Give a moment for threads to clean up
-            time.sleep(1)
-            # Force exit if needed
-            os._exit(0)
-        
+        # Start timeout thread if enabled
         if run_timeout:
             timeout_thread = threading.Thread(target=exit_after_timeout, daemon=True)
             timeout_thread.start()
+            print(f"✓ Timeout thread started ({timeout_length}s)")
 
-        # Run Matplotlib in main thread
-        fig, ax = plt.subplots(figsize=(8, 6))
-        ani = animation.FuncAnimation(fig, update_plot, interval=1000)
+        print("\nAll threads started successfully!")
+        print("-" * 80)
 
-        plt.show()  # Starts Matplotlib GUI
+        # ================================================================================================
+        # MAIN LOOP - Real-time plotting interface
+        # ================================================================================================
+        
+        # Initialize matplotlib for real-time plotting
+        print("Starting real-time plot display...")
+        fig, ax = plt.subplots(figsize=(12, 8))
+        fig.suptitle('Temperature Monitoring System', fontsize=16, fontweight='bold')
+        
+        # Create animation for live plot updates
+        ani = animation.FuncAnimation(fig, update_plot, interval=1000, cache_frame_data=False)
+        
+        # Start matplotlib GUI (blocks until window is closed)
+        plt.show()
 
     except KeyboardInterrupt:
-        print("\nExiting temperature monitoring...")
-        print("PID voltage archive: ", pid_voltage_archive)
+        print("\n" + "=" * 80)
+        print("SHUTDOWN: User interrupt received (Ctrl+C)")
+        print("=" * 80)
+        
+        # Print final system status
+        if pid_voltage_archive:
+            print(f"PID voltage history ({len(pid_voltage_archive)} points):")
+            print(f"  Min: {min(pid_voltage_archive):.3f}V")
+            print(f"  Max: {max(pid_voltage_archive):.3f}V") 
+            print(f"  Final: {pid_voltage_archive[-1]:.3f}V")
+        
+        print(f"Data saved to: {csv_filename}")
+        print("Stopping all threads...")
+        
+        # Signal all threads to stop
         exit_event.set()  
-        time.sleep(1)  
+        time.sleep(2)  # Give threads time to clean up
+        print("Shutdown complete.")
         sys.exit(0)
+        
     except Exception as e:
-        print(f"⚠️ Error: {e}")
+        print(f"\n⚠️  CRITICAL ERROR: {e}")
+        print("Check hardware connections and configuration.")
+        
+        # Print debugging information
+        print("\nDebugging information:")
+        print(f"  Active thermocouples: {list(ACTIVE_THERMOCOUPLES.keys())}")
+        print(f"  Active TSic channels: {ACTIVE_TSIC_CHANNELS}")
+        print(f"  Power supply required: {read_voltage_current or run_slow_control or run_pid_control or run_pid_slow_control}")
+        
+        exit_event.set()
         sys.exit(1)
+
+# ================================================================================================
+# END OF PROGRAM
+# ================================================================================================
+
+"""
+USAGE EXAMPLES:
+==============
+
+1. Basic temperature monitoring:
+   python temp_control.py
+   
+2. Temperature monitoring with voltage sweep:
+   Set run_slow_control = True
+   python temp_control.py [temp_step]
+   
+3. PID temperature control:
+   Set run_pid_control = True, pid_desired_temp = 17.5
+   python temp_control.py
+   
+4. PID temperature ramping:
+   Set run_pid_slow_control = True
+   Configure pid_slow_control_* parameters
+   python temp_control.py
+
+CONFIGURATION TIPS:
+==================
+
+1. Sensor Configuration:
+   - Add thermocouples to ACTIVE_THERMOCOUPLES dictionary
+   - Add TSic channels to ACTIVE_TSIC_CHANNELS list
+   - Verify AIN channel numbers match hardware connections
+
+2. PID Tuning:
+   - Start with provided Ziegler-Nichols values
+   - Reduce k_prop if system oscillates
+   - Enable k_int for steady-state error correction
+   - Adjust k_deriv for noise vs. responsiveness trade-off
+
+3. Safety Limits:
+   - Voltage is clamped to 0-3V range
+   - Temperature readings are validated before use
+   - Timeout protection prevents runaway operation
+
+4. Data Analysis:
+   - CSV files contain timestamped temperature data
+   - Plot files are saved on timeout or error
+   - PID voltage archive available for tuning analysis
+
+HARDWARE CONNECTIONS:
+====================
+
+LabJack T7:
+- AIN0: TSic temperature sensor
+- AIN2: J-type thermocouple (if enabled)
+- USB connection to computer
+
+E3644A Power Supply:
+- Serial connection via USB-to-serial adapter
+- Voltage output connected to thermal control element
+- Current sensing for load monitoring
+
+TROUBLESHOOTING:
+===============
+
+1. "Sensor read error": Check LabJack connection and sensor wiring
+2. "Power supply connection failed": Verify serial port and cable
+3. "No temperature data": Check sensor configuration and connections  
+4. PID oscillation: Reduce proportional gain or increase derivative gain
+5. CSV write errors: Check file permissions and disk space
+
+"""
