@@ -278,7 +278,7 @@ if __name__ == "__main__":
     try:
         handle = ljm.openS("T7", "ANY", "ANY")
         configure_thermocouple(handle)
-        supply = E3644A("/dev/tty.PL2303G-USBtoUART120")
+        supply = E3644A("/dev/tty.usbmodemSN234567892")
         # print(f"Connected to: {supply.identify()}")
 
         print(f"Starting live temperature monitoring... Data will be saved in {csv_filename}\n")

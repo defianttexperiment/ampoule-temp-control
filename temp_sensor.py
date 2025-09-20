@@ -977,7 +977,7 @@ if __name__ == "__main__":
         if read_voltage_current or run_slow_control or run_pid_control or run_pid_slow_control:
             print("Initializing power supply connection...")
             try:
-                supply = E3644A("/dev/tty.PL2303G-USBtoUART120")  # Adjust port as needed
+                supply = E3644A("/dev/tty.usbmodemSN234567892")  # Adjust port as needed
                 print("Connected to E3644A power supply")
             except Exception as e:
                 print(f"Power supply connection failed: {e}")

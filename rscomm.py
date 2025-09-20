@@ -134,7 +134,7 @@ class E3644A:
         Returns:
             float: The current limit in amperes
         """
-        print(f"Current setting: {self.query("CURR?")}")
+        print(f"Current setting: {self.query('CURR?')}")
         return float(self.query("CURR?"))
     
     def get_measured_current(self):

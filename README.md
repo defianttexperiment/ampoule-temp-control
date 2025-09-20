@@ -51,3 +51,25 @@ Used to communicate with the power supply. Mostly used to import functions; gene
 
 ## motorcomm.py
 Used to communicate with the Z-axis motor. Used on its own, but currently a work in progress.
+
+# Installation Instructions
+
+1. conda environment -> 
+
+```
+conda env create -f environment_new.yml
+```
+then
+```
+conda activate ampoule-temp-control
+```
+
+2. Install the labjack drivers from here: appropriate for your system: https://files.labjack.com/installers/LJM/
+
+3. Install appropriate Picoscope software from here: https://www.picotech.com/downloads 
+
+4. Check the serial port where the USB hub is on your Mac via: `ls /dev/tty*` while you are connected to the USB hub
+
+5. Replace all instances of the old USB serial port in `log_data.py` and `temp_sensor.py`
+
+GLHF :)
