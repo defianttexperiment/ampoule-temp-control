@@ -19,7 +19,7 @@ Hardware Requirements:
 - Temperature sensors (J-type thermocouples, TSic sensors, and/or thermistors)
 """
 
-from statistics import mean
+from statistics import mean, median
 import time
 import sys
 import csv  
@@ -36,10 +36,13 @@ from rscomm import *
 # CONFIGURATION SECTION - Modify these parameters to customize system behavior
 # ================================================================================================
 
+# ---------------- HARDWARE CONFIGURATION ----------------
+supply_port = "/dev/tty.PL2303G-USBtoUART120"      # USB port name that connects via RS232 to power supply
+
 # ---------------- DATA LOGGING CONFIGURATION ----------------
 # Controls what data is collected and how it's processed
 
-read_voltage_current = False        # Enable voltage/current monitoring from power supply
+read_voltage_current = False       # Enable voltage/current monitoring from power supply
                                    # Requires rscomm library and compatible power supply
 
 run_log_data = True                # Enable temperature data logging to CSV
@@ -83,11 +86,11 @@ ACTIVE_THERMOCOUPLES = {
 
 # TSic Temperature Sensors (digital sensors with analog output)
 # List of AIN channel numbers where TSic sensors are connected
-ACTIVE_TSIC_CHANNELS = [0]  # TSic sensor on AIN0
+ACTIVE_TSIC_CHANNELS = [0]
 
 # Thermistor Temperature Sensors
 # List of AIN channel numbers where thermistors are connected
-ACTIVE_THERMISTOR_CHANNELS = []  # No thermistors currently configured
+ACTIVE_THERMISTOR_CHANNELS = []
 
 # ================================================================================================
 # SYSTEM INITIALIZATION - Automatic configuration based on user settings
@@ -115,6 +118,7 @@ print(f"Data will be logged to: {csv_filename}")
 time_data = []  # Time points for x-axis
 thermo_temp_data = {tc: [] for tc in ACTIVE_THERMOCOUPLES}  # Thermocouple temperature history
 tsic_temp_data = {ch: [] for ch in ACTIVE_TSIC_CHANNELS}    # TSic temperature history
+thermistor_temp_data = {tm: [] for tm in ACTIVE_THERMISTOR_CHANNELS}  # Thermistor temperature history
 voltage_data = []      # Power supply voltage history
 current_data = []      # Power supply current history
 pid_voltage_archive = []  # Archive of PID-commanded voltages for analysis
@@ -131,6 +135,7 @@ class SharedData:
         current_temp: Most recent temperature reading (°C)
         avg_thermo: Dictionary of averaged thermocouple readings
         avg_tsic: Dictionary of averaged TSic sensor readings
+        avg_thermistor: Dictionary of averaged thermistor readings
         current_voltage: Most recent voltage measurement (V)
         current_current: Most recent current measurement (A)
     """
@@ -140,15 +145,17 @@ class SharedData:
         self.current_temp = None      # None indicates no data available yet
         self.avg_thermo = {}          # Averaged thermocouple data by sensor name
         self.avg_tsic = {}            # Averaged TSic data by channel number
+        self.avg_thermistor = {}      # Averaged thermistor data by channel number
         self.current_voltage = None   # Latest voltage reading
         self.current_current = None   # Latest current reading
     
-    def update_temperature(self, temp, avg_thermo_data, avg_tsic_data):
+    def update_temperature(self, temp, avg_thermo_data, avg_tsic_data, avg_thermistor_data):
         """Update temperature data in thread-safe manner."""
         with self.lock:
             self.current_temp = temp
             self.avg_thermo = avg_thermo_data.copy()
             self.avg_tsic = avg_tsic_data.copy()
+            self.avg_thermistor = avg_thermistor_data.copy()
 
     def update_voltage(self, voltage):
         """Update voltage measurement in thread-safe manner."""
@@ -166,16 +173,25 @@ class SharedData:
             return self.current_temp
 
     def get_avg_temperature(self):
-        """Get average of all TSic sensor readings (thread-safe)."""
+        """Get average of all active sensor readings (thread-safe)."""
         with self.lock:
+            all_temps = []
             if self.avg_tsic:
-                return mean(self.avg_tsic.values())
+                all_temps.extend(self.avg_tsic.values())
+            if self.avg_thermistor:
+                all_temps.extend(self.avg_thermistor.values())
+            if self.avg_thermo:
+                all_temps.extend(self.avg_thermo.values())
+            
+            if all_temps:
+                return median(all_temps)
             return None
     
     def get_all_data(self):
         """Get complete snapshot of all temperature data (thread-safe)."""
         with self.lock:
-            return self.current_temp, self.avg_thermo.copy(), self.avg_tsic.copy()
+            return (self.current_temp, self.avg_thermo.copy(), 
+                   self.avg_tsic.copy(), self.avg_thermistor.copy())
 
 # Create global shared data instance
 shared_data = SharedData()
@@ -183,6 +199,7 @@ shared_data = SharedData()
 # Rolling data storage for averaging - keeps recent readings for smoothing
 thermo_rolling_data = {tc: [] for tc in ACTIVE_THERMOCOUPLES}
 tsic_rolling_data = {ch: [] for ch in ACTIVE_TSIC_CHANNELS}
+thermistor_rolling_data = {tm: [] for tm in ACTIVE_THERMISTOR_CHANNELS}
 
 # Thread synchronization objects
 data_lock = threading.Lock()  # Protects plotting data
@@ -201,6 +218,9 @@ def create_csv_file():
     
     # Add TSic sensor columns
     headers.extend([f"TSic AIN{ch} (°C)" for ch in ACTIVE_TSIC_CHANNELS])
+    
+    # Add thermistor columns
+    headers.extend([f"Thermistor AIN{tm} (°C)" for tm in ACTIVE_THERMISTOR_CHANNELS])
     
     # Add electrical measurement columns if enabled
     if read_voltage_current:
@@ -278,8 +298,11 @@ def configure_thermistor(handle):
     """
     print("Configuring thermistors...")
     for ain_channel in ACTIVE_THERMISTOR_CHANNELS:
+        ljm.eWriteName(handle, f"AIN{ain_channel}_EF_INDEX", 50)
+        ljm.eWriteName(handle, f"AIN{ain_channel}_RANGE", 10.0)
+        ljm.eWriteName(handle, f"AIN{ain_channel}_RESOLUTION_INDEX", 8)
         ljm.eWriteName(handle, f"AIN{ain_channel}_EF_CONFIG_A", 1)    # °C output
-        ljm.eWriteName(handle, f"AIN{ain_channel}_EF_CONFIG_B", 1)    # 10µA excitation current
+        ljm.eWriteName(handle, f"AIN{ain_channel}_EF_CONFIG_B", 0)    # 10µA excitation current
         ljm.eWriteName(handle, f"AIN{ain_channel}_EF_CONFIG_F", 10000)  # R₀ = 10kΩ at 25°C
         
         # Steinhart-Hart equation coefficients for accurate temperature calculation
@@ -328,10 +351,10 @@ def read_sensors():
 
         # Read thermistor temperatures using extended features
         thermistor_temps = {}
-        for name, config in ACTIVE_THERMOCOUPLES.items():  # Note: This seems to be a bug in original code
-            channel = config['channel']
-            temp = ljm.eReadName(handle, f"AIN{channel}_EF_READ_A")
-            thermistor_temps[name] = temp
+        for tm in ACTIVE_THERMISTOR_CHANNELS:
+            # Read processed temperature from extended feature
+            temp = ljm.eReadName(handle, f"AIN{tm}_EF_READ_A")
+            thermistor_temps[tm] = temp
         
         ljm.close(handle)  # Clean up connection
         return thermo_temps, tsic_temps, thermistor_temps
@@ -372,20 +395,29 @@ def log_data(supply):
         thermo_temps, tsic_temps, thermistor_temps = read_sensors()
         
         # Process temperature data if readings were successful
-        if thermo_temps or tsic_temps:
+        if thermo_temps is not None or tsic_temps is not None or thermistor_temps is not None:
             with data_lock:  # Thread-safe data update
                 # Update rolling averages for thermocouples
                 for tc in ACTIVE_THERMOCOUPLES:
-                    thermo_rolling_data[tc].append(thermo_temps[tc])
-                    # Keep only recent readings for averaging window
-                    if len(thermo_rolling_data[tc]) > average_interval:
-                        thermo_rolling_data[tc].pop(0)
+                    if thermo_temps and tc in thermo_temps:
+                        thermo_rolling_data[tc].append(thermo_temps[tc])
+                        # Keep only recent readings for averaging window
+                        if len(thermo_rolling_data[tc]) > average_interval:
+                            thermo_rolling_data[tc].pop(0)
 
                 # Update rolling averages for TSic sensors
                 for ch in ACTIVE_TSIC_CHANNELS:
-                    tsic_rolling_data[ch].append(tsic_temps[ch])
-                    if len(tsic_rolling_data[ch]) > average_interval:
-                        tsic_rolling_data[ch].pop(0)
+                    if tsic_temps and ch in tsic_temps:
+                        tsic_rolling_data[ch].append(tsic_temps[ch])
+                        if len(tsic_rolling_data[ch]) > average_interval:
+                            tsic_rolling_data[ch].pop(0)
+
+                # Update rolling averages for thermistors
+                for tm in ACTIVE_THERMISTOR_CHANNELS:
+                    if thermistor_temps and tm in thermistor_temps:
+                        thermistor_rolling_data[tm].append(thermistor_temps[tm])
+                        if len(thermistor_rolling_data[tm]) > average_interval:
+                            thermistor_rolling_data[tm].pop(0)
         
         # Read electrical measurements from power supply
         if read_voltage_current:
@@ -405,18 +437,21 @@ def log_data(supply):
         # Determine if we have enough data to process and log
         should_process = len(time_data) == 0  # Always process first iteration
         
-        # Check if we have thermocouple data to process
+        # Check if we have any sensor data to process
         if ACTIVE_THERMOCOUPLES:
             first_tc = next(iter(ACTIVE_THERMOCOUPLES))
             should_process = should_process or len(thermo_rolling_data[first_tc]) > 0
             
-        # Check if we have TSic data to process
         if ACTIVE_TSIC_CHANNELS:
             first_ch = ACTIVE_TSIC_CHANNELS[0]
             should_process = should_process or len(tsic_rolling_data[first_ch]) > 0
+
+        if ACTIVE_THERMISTOR_CHANNELS:
+            first_tm = ACTIVE_THERMISTOR_CHANNELS[0]
+            should_process = should_process or len(thermistor_rolling_data[first_tm]) > 0
             
         # Skip processing if no active sensors
-        if not ACTIVE_THERMOCOUPLES and not ACTIVE_TSIC_CHANNELS:
+        if not ACTIVE_THERMOCOUPLES and not ACTIVE_TSIC_CHANNELS and not ACTIVE_THERMISTOR_CHANNELS:
             should_process = False
 
         # Process and log data
@@ -426,47 +461,71 @@ def log_data(supply):
 
             with data_lock:
                 # Calculate averages and current values
-                avg_thermo = {tc: np.mean(thermo_rolling_data[tc]) for tc in ACTIVE_THERMOCOUPLES}
-                avg_tsic = {ch: np.mean(tsic_rolling_data[ch]) for ch in ACTIVE_TSIC_CHANNELS}
-                current_thermo = {tc: thermo_rolling_data[tc][-1] for tc in ACTIVE_THERMOCOUPLES}
-                current_tsic = {ch: tsic_rolling_data[ch][-1] for ch in ACTIVE_TSIC_CHANNELS}
+                avg_thermo = {tc: np.median(thermo_rolling_data[tc]) for tc in ACTIVE_THERMOCOUPLES if thermo_rolling_data[tc]}
+                avg_tsic = {ch: np.median(tsic_rolling_data[ch]) for ch in ACTIVE_TSIC_CHANNELS if tsic_rolling_data[ch]}
+                avg_thermistor = {tm: np.median(thermistor_rolling_data[tm]) for tm in ACTIVE_THERMISTOR_CHANNELS if thermistor_rolling_data[tm]}
+                
+                current_thermo = {tc: thermo_rolling_data[tc][-1] for tc in ACTIVE_THERMOCOUPLES if thermo_rolling_data[tc]}
+                current_tsic = {ch: tsic_rolling_data[ch][-1] for ch in ACTIVE_TSIC_CHANNELS if tsic_rolling_data[ch]}
+                current_thermistor = {tm: thermistor_rolling_data[tm][-1] for tm in ACTIVE_THERMISTOR_CHANNELS if thermistor_rolling_data[tm]}
                 
                 # Update shared data for control threads
-                if ACTIVE_TSIC_CHANNELS:
+                # Determine current temperature from available sensors
+                current_temp = None
+                if ACTIVE_TSIC_CHANNELS and avg_tsic:
                     current_temp = avg_tsic[ACTIVE_TSIC_CHANNELS[0]]
-                    shared_data.update_temperature(current_temp, avg_thermo, avg_tsic)
+                elif ACTIVE_THERMISTOR_CHANNELS and avg_thermistor:
+                    current_temp = avg_thermistor[ACTIVE_THERMISTOR_CHANNELS[0]]
+                elif ACTIVE_THERMOCOUPLES and avg_thermo:
+                    current_temp = list(avg_thermo.values())[0]
+                
+                if current_temp is not None:
+                    shared_data.update_temperature(current_temp, avg_thermo, avg_tsic, avg_thermistor)
 
                 # Update plotting data
                 time_data.append(current_time)
                 for tc in ACTIVE_THERMOCOUPLES:
-                    thermo_temp_data[tc].append(avg_thermo[tc])
+                    if tc in avg_thermo:
+                        thermo_temp_data[tc].append(avg_thermo[tc])
                 for ch in ACTIVE_TSIC_CHANNELS:
-                    tsic_temp_data[ch].append(avg_tsic[ch])
+                    if ch in avg_tsic:
+                        tsic_temp_data[ch].append(avg_tsic[ch])
+                for tm in ACTIVE_THERMISTOR_CHANNELS:
+                    if tm in avg_thermistor:
+                        thermistor_temp_data[tm].append(avg_thermistor[tm])
 
                 # Limit plotting data to last hour for performance
                 if len(time_data) > 3600:
                     time_data.pop(0)
                     for tc in thermo_temp_data:
-                        thermo_temp_data[tc].pop(0)
+                        if thermo_temp_data[tc]:
+                            thermo_temp_data[tc].pop(0)
                     for ch in tsic_temp_data:
-                        tsic_temp_data[ch].pop(0)
+                        if tsic_temp_data[ch]:
+                            tsic_temp_data[ch].pop(0)
+                    for tm in thermistor_temp_data:
+                        if thermistor_temp_data[tm]:
+                            thermistor_temp_data[tm].pop(0)
 
             # Print status to console
             status_parts = []
-            if ACTIVE_THERMOCOUPLES:
-                tc_status = " | ".join([f"{tc}: {avg_thermo[tc]:.2f}°C" for tc in ACTIVE_THERMOCOUPLES])
+            if ACTIVE_THERMOCOUPLES and avg_thermo:
+                tc_status = " | ".join([f"{tc}: {avg_thermo[tc]:.2f}°C" for tc in avg_thermo])
                 status_parts.append(tc_status)
-            if ACTIVE_TSIC_CHANNELS:
-                tsic_status = " | ".join([f"TSic AIN{ch}: {avg_tsic[ch]:.2f}°C" for ch in ACTIVE_TSIC_CHANNELS])
+            if ACTIVE_TSIC_CHANNELS and avg_tsic:
+                tsic_status = " | ".join([f"TSic AIN{ch}: {avg_tsic[ch]:.2f}°C" for ch in avg_tsic])
                 status_parts.append(tsic_status)
+            if ACTIVE_THERMISTOR_CHANNELS and avg_thermistor:
+                thermistor_status = " | ".join([f"Thermistor AIN{tm}: {avg_thermistor[tm]:.2f}°C" for tm in avg_thermistor])
+                status_parts.append(thermistor_status)
                 
             if status_parts:
                 print(f"[{timestamp_str}] " + " || ".join(status_parts))
             
             # Write to CSV file
-            write_to_csv(timestamp_str, current_time, current_thermo, current_tsic, avg_thermo, avg_tsic)
+            write_to_csv(timestamp_str, current_time, current_thermo, current_tsic, current_thermistor, avg_thermo, avg_tsic, avg_thermistor)
 
-def write_to_csv(timestamp_str, current_time, current_thermo, current_tsic, avg_thermo, avg_tsic):
+def write_to_csv(timestamp_str, current_time, current_thermo, current_tsic, current_thermistor, avg_thermo, avg_tsic, avg_thermistor):
     """
     Write sensor data to CSV file.
     
@@ -482,15 +541,21 @@ def write_to_csv(timestamp_str, current_time, current_thermo, current_tsic, avg_
             
             # Add thermocouple data (raw or averaged)
             if log_data_record_raw_data:
-                row.extend([current_thermo[tc] for tc in ACTIVE_THERMOCOUPLES])
+                row.extend([current_thermo.get(tc, '') for tc in ACTIVE_THERMOCOUPLES])
             else:
-                row.extend([avg_thermo[tc] for tc in ACTIVE_THERMOCOUPLES])
+                row.extend([avg_thermo.get(tc, '') for tc in ACTIVE_THERMOCOUPLES])
             
             # Add TSic data (raw or averaged)
             if log_data_record_raw_data:
-                row.extend([current_tsic[ch] for ch in ACTIVE_TSIC_CHANNELS])
+                row.extend([current_tsic.get(ch, '') for ch in ACTIVE_TSIC_CHANNELS])
             else:
-                row.extend([avg_tsic[ch] for ch in ACTIVE_TSIC_CHANNELS])
+                row.extend([avg_tsic.get(ch, '') for ch in ACTIVE_TSIC_CHANNELS])
+
+            # Add thermistor data (raw or averaged)
+            if log_data_record_raw_data:
+                row.extend([current_thermistor.get(tm, '') for tm in ACTIVE_THERMISTOR_CHANNELS])
+            else:
+                row.extend([avg_thermistor.get(tm, '') for tm in ACTIVE_THERMISTOR_CHANNELS])
             
             # Add electrical measurements if enabled
             if read_voltage_current:
@@ -530,12 +595,19 @@ def update_plot(frame):
             if tsic_temp_data[ch]:  # Only plot if data exists
                 ax.plot(time_data, tsic_temp_data[ch], 
                        label=f"TSic AIN{ch} (°C)", 
-                       linestyle='--', linewidth=2)
+                       linestyle='-', linewidth=2)
+                
+        # Plot thermistor data with solid lines
+        for tm in ACTIVE_THERMISTOR_CHANNELS:
+            if thermistor_temp_data[tm]:  # Only plot if data exists
+                ax.plot(time_data, thermistor_temp_data[tm], 
+                       label=f"Thermistor AIN{tm} (°C)", 
+                       linestyle='-', linewidth=2)
 
     # Format plot appearance
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Temperature (°C)")
-    ax.set_title("Live Temperature Readings (Thermocouples & TSic)")
+    ax.set_title("Live Temperature Readings")
     ax.legend()
     ax.grid(True, alpha=0.3)
     
@@ -644,7 +716,7 @@ def pid_control(desired_temp, interval):
     current_temp = shared_data.get_avg_temperature()
     integral = 0
     previous_error = 0
-    voltage = 0.5  # Start with moderate voltage
+    voltage = supply.get_measured_voltage()
     
     # PID tuning parameters (Ziegler-Nichols tuned)
     k_prop = 0.368    # Proportional gain
@@ -681,7 +753,7 @@ def pid_control(desired_temp, interval):
         voltage = voltage + correction
         
         # Clamp voltage to safe limits
-        voltage = max(0, min(voltage, 3))  # 0-3V range
+        voltage = max(0, min(voltage, 1.5))  # 0-1.5V range because over 1.5 is inefficient
         
         # Apply voltage to power supply
         try:
@@ -761,7 +833,7 @@ def pid_slow_control(interval, supply):
         voltage = voltage + correction
         
         # Clamp voltage to safe limits
-        voltage = max(0, min(voltage, 3))
+        voltage = max(0, min(voltage, 1.5))  # 0-1.5V range because over 1.5 is inefficient
         
         try:
             supply.set_voltage(voltage)
@@ -802,8 +874,8 @@ def pid_slow_control(interval, supply):
         correction = (P_out + I_out + D_out) * -1
         voltage = voltage + correction
         
-        # Clamp voltage with tighter upper limit for starting temp
-        voltage = max(0, min(voltage, 1.5))
+        # Clamp voltage to safe limits
+        voltage = max(0, min(voltage, 1.5))  # 0-1.5V range because over 1.5 is inefficient
         pid_voltage_archive.append(voltage)
         
         try:
@@ -942,9 +1014,6 @@ if __name__ == "__main__":
     """
     
     try:
-        print("=" * 80)
-        print("TEMPERATURE MONITORING AND CONTROL SYSTEM")
-        print("=" * 80)
         print(f"Configuration:")
         print(f"  Data logging: {'ON' if run_log_data else 'OFF'}")
         print(f"  Voltage/current monitoring: {'ON' if read_voltage_current else 'OFF'}")
@@ -958,7 +1027,7 @@ if __name__ == "__main__":
         else:
             print("Monitoring only")
         print(f"  Timeout: {'ON' if run_timeout else 'OFF'} ({timeout_length}s)" if run_timeout else "  Timeout: OFF")
-        print(f"  Active sensors: {len(ACTIVE_THERMOCOUPLES)} thermocouples, {len(ACTIVE_TSIC_CHANNELS)} TSic")
+        print(f"  Active sensors: {len(ACTIVE_THERMOCOUPLES)} thermocouples, {len(ACTIVE_TSIC_CHANNELS)} TSic, {len(ACTIVE_THERMISTOR_CHANNELS)} thermistors")
         print("-" * 80)
         
         # Initialize LabJack connection and configure sensors
@@ -977,7 +1046,7 @@ if __name__ == "__main__":
         if read_voltage_current or run_slow_control or run_pid_control or run_pid_slow_control:
             print("Initializing power supply connection...")
             try:
-                supply = E3644A("/dev/tty.usbmodemSN234567892")  # Adjust port as needed
+                supply = E3644A(supply_port)  # Adjust port as needed
                 print("Connected to E3644A power supply")
             except Exception as e:
                 print(f"Power supply connection failed: {e}")
@@ -1050,13 +1119,6 @@ if __name__ == "__main__":
         print("SHUTDOWN: User interrupt received (Ctrl+C)")
         print("=" * 80)
         
-        # Print final system status
-        if pid_voltage_archive:
-            print(f"PID voltage history ({len(pid_voltage_archive)} points):")
-            print(f"  Min: {min(pid_voltage_archive):.3f}V")
-            print(f"  Max: {max(pid_voltage_archive):.3f}V") 
-            print(f"  Final: {pid_voltage_archive[-1]:.3f}V")
-        
         print(f"Data saved to: {csv_filename}")
         print("Stopping all threads...")
         
@@ -1074,6 +1136,7 @@ if __name__ == "__main__":
         print("\nDebugging information:")
         print(f"  Active thermocouples: {list(ACTIVE_THERMOCOUPLES.keys())}")
         print(f"  Active TSic channels: {ACTIVE_TSIC_CHANNELS}")
+        print(f"  Active thermistor channels: {ACTIVE_THERMISTOR_CHANNELS}")
         print(f"  Power supply required: {read_voltage_current or run_slow_control or run_pid_control or run_pid_slow_control}")
         
         exit_event.set()
@@ -1109,6 +1172,7 @@ CONFIGURATION TIPS:
 1. Sensor Configuration:
    - Add thermocouples to ACTIVE_THERMOCOUPLES dictionary
    - Add TSic channels to ACTIVE_TSIC_CHANNELS list
+   - Add thermistor channels to ACTIVE_THERMISTOR_CHANNELS list
    - Verify AIN channel numbers match hardware connections
 
 2. PID Tuning:
@@ -1131,8 +1195,9 @@ HARDWARE CONNECTIONS:
 ====================
 
 LabJack T7:
-- AIN0: TSic temperature sensor
-- AIN2: J-type thermocouple (if enabled)
+- AIN0-N: TSic temperature sensors
+- AIN2: J-type thermocouple (if enabled) 
+- AIN3: Thermistor (if enabled)
 - USB connection to computer
 
 E3644A Power Supply:

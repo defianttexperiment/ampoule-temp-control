@@ -38,7 +38,7 @@ from scipy.signal import find_peaks, find_peaks_cwt, savgol_filter, morlet
 
 # ---------------- BASIC DATA SETTINGS ----------------
 # What data are you analyzing?
-file_name = '0820_swing_middle'  # CHANGE THIS: Name of your data directory/file prefix
+file_name = '0828_swing_bottom'  # CHANGE THIS: Name of your data directory/file prefix
                                  # Script expects: {file_name}/waveform_files.csv OR {file_name}data.csv
                                  # And: {file_name}Tdata.csv (temperature data)
 
@@ -47,14 +47,14 @@ temp_input_is_raw_data = True    # True: Temperature data needs smoothing (typic
                                 # False: Temperature data is already processed
 use_channel_b = True            # True: Analyze both Channel A and B from PicoScope
                                # False: Only analyze Channel A (light intensity)
-invert_correction = False       # True: Flip the sign of Channel A data (if inverted)
-plus_40_correction = False      # True: Add 40mV to Channel A data (baseline correction)
+invert_correction = True       # True: Flip the sign of Channel A data (if inverted)
+plus_40_correction = True      # True: Add 40mV to Channel A data (baseline correction)
 
 # ---------------- DISPLAY SETTINGS ----------------
 # What portion of data would you like to analyze and display?
 show_peak_lines = True          # True: Show vertical lines at detected peaks in plots
-start_time = 1000               # Start time (seconds) for analysis window
-end_time = 10000                # End time (seconds) for analysis window
+start_time = 800               # Start time (seconds) for analysis window
+end_time = 2800                # End time (seconds) for analysis window
 
 # ---------------- ADVANCED PROCESSING PARAMETERS ----------------
 # Fine-tune these if you understand the signal processing involved
@@ -627,5 +627,7 @@ print(f"  - Time range: {smtimedata[0]:.1f} to {smtimedata[-1]:.1f} seconds")
 print(f"  - Temperature range: {min(timed_temp_data):.1f} to {max(timed_temp_data):.1f} °C")
 print(f"  - Peaks detected: {len(all_peaks)}")
 print(f"  - Average peak rate: {len(all_peaks)/(max(timed_temp_data)-min(timed_temp_data)):.2f} peaks/°C")
+
+print(all_peaks_temps)
 
 plt.show()
