@@ -11,4 +11,5 @@ dependencies:
   - pyserial
   - pip
   - pip:
+    - dotenv
     - labjack-ljm
