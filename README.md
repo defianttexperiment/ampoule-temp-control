@@ -22,7 +22,8 @@ The TSic sensor has three wires: a ground, a voltage source, and a signal wire. 
     - vim .env
 3. Write (replace with your serial port info):
 		SERIAL_PORT=/dev/tty.usbmodemSN234567892
-4. Run the code as normal! do NOT edit the serial ports in the actual files
+4. If you don't have the dotenv package yet (I have since updated the .yml), run pip install dotenv
+5. Run the code as normal! do NOT edit the serial ports in the actual files
 
 
 ## temp_sensor.py
