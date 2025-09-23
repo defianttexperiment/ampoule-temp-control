@@ -2,19 +2,28 @@
 
 ## Getting started
 
-Software: Create a Conda environment with the environment.yml file in this directory. This can be done with the following commands: conda environment -> conda env create -f environment_new.yml -> conda activate ampoule-temp-control.
-
-Temperature measurement: Our setup uses a LabJack T7 that requires a driver to operate. You can find the appropriate driver here: https://support.labjack.com/docs/ljm-software-installer-downloads-t4-t7-t8-digit.
+#### Software
+ Create a Conda environment with the environment.yml file in this directory. This can be done with the following commands: conda environment -> conda env create -f environment_sep2025.yml -n ampoule-temp-control -> conda activate ampoule-temp-control.
+#### Temperature measurement
+Our setup uses a LabJack T7 that requires a driver to operate. You can find the appropriate driver here: https://support.labjack.com/docs/ljm-software-installer-downloads-t4-t7-t8-digit.
 
 The TSic sensor has three wires: a ground, a voltage source, and a signal wire. These should go into the LabJack in GND, VS, and an AIN port (recommended AIN0 but doesn't really matter) respectively. Once that's done, connect the USB-C attachment to your computer to connect it to the LabJack and run "python temp_sensor.py" or "python log_data.py".
 
-PicoScope measurement: Download PicoScope 7 and connect the USB-C attachment to connect to the PicoScope 2000. This should automatically be set up for collecting data. Channel A refers to data collected for fringe counting; Channel B refers to data collected for scattering measurement. On the left, you can change the y-axis for data collection; both channels should be set to 50 or 100 mV to view data more easily. At the top, you can change the x-axis scale; this should be set to 10 or 20 s/div to view data more easily.
+#### Picoscope Measurement
+ Download PicoScope 7 and connect the USB-C attachment to connect to the PicoScope 2000. This should automatically be set up for collecting data. Channel A refers to data collected for fringe counting; Channel B refers to data collected for scattering measurement. On the left, you can change the y-axis for data collection; both channels should be set to 50 or 100 mV to view data more easily. At the top, you can change the x-axis scale; this should be set to 10 or 20 s/div to view data more easily.
 
-Voltage control: To connect to the power supply, we use a PL2303 USB-to-serial connection. This requires a driver installed on your computer. On MacOS, you can download "PL2303 Serial" from the App Store, then go to Login Items & Extensions -> Driver Extensions and allow both of them to run, following this guide: https://kb.plugable.com/serial-adapter/how-to-install-prolific-serial-port-drivers-on-macos. I have no clue how it works on Windows. 
+#### Voltage Control
+ To connect to the power supply, we use a PL2303 USB-to-serial connection. This requires a driver installed on your computer. On MacOS, you can download "PL2303 Serial" from the App Store, then go to Login Items & Extensions -> Driver Extensions and allow both of them to run, following this guide: https://kb.plugable.com/serial-adapter/how-to-install-prolific-serial-port-drivers-on-macos. I have no clue how it works on Windows. 
 
-The connection to the power supply requires a certain port name that may be different on your computer. You can typically run "ls /dev/tty*" in the root directory of your computer and find a port name that only appears when the connector is plugged in. Change supply_port in temp_sensor and log_data to the correct port for your computer.
+#### Serial Connection
+1. Find your serial port name (using "ls /dev/tty*" in the root directory of your computer). 
+2. Make a .env file (IF YOU NAME IT SOMETHING ELSE ADD IT TO .gitignore). Commands:
+    - echo ".env" >> .gitignore
+    - vim .env
+3. Write (replace with your serial port info):
+		SERIAL_PORT=/dev/tty.usbmodemSN234567892
+4. Run the code as normal! do NOT edit the serial ports in the actual files
 
-Sorry this is so difficult! This is all one-time stuff that you don't have to think about ever again.
 
 ## temp_sensor.py
 The main function in this repo. This does three things:

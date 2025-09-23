@@ -31,13 +31,14 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import numpy as np
 from rscomm import *
-
+from dotenv import load_dotenv
 # ================================================================================================
 # CONFIGURATION SECTION - Modify these parameters to customize system behavior
 # ================================================================================================
 
 # ---------------- HARDWARE CONFIGURATION ----------------
-supply_port = "/dev/tty.PL2303G-USBtoUART120"      # USB port name that connects via RS232 to power supply
+load_dotenv()
+supply_port = os.getenv("SERIAL_PORT")     # USB port name that connects via RS232 to power supply
 
 # ---------------- DATA LOGGING CONFIGURATION ----------------
 # Controls what data is collected and how it's processed
