@@ -38,7 +38,7 @@ from scipy.signal import find_peaks, find_peaks_cwt, savgol_filter, morlet
 
 # ---------------- BASIC DATA SETTINGS ----------------
 # What data are you analyzing?
-file_name = '0828_swing_bottom'  # CHANGE THIS: Name of your data directory/file prefix
+file_name = '0922_swing_top'  # CHANGE THIS: Name of your data directory/file prefix
                                  # Script expects: {file_name}/waveform_files.csv OR {file_name}data.csv
                                  # And: {file_name}Tdata.csv (temperature data)
 
@@ -65,7 +65,7 @@ half_life = 30                  # Time constant (seconds) for exponential smooth
                                # Smaller = less smoothing, larger = more smoothing
                                # Recommended: 30 (true value likely between 10-60)
 
-peak_prominence = 10            # Minimum peak height (mV) to be counted as a real peak
+peak_prominence = 40            # Minimum peak height (mV) to be counted as a real peak
                                # Increase if too many false peaks, decrease if missing real peaks
 
 # ============================================================================
