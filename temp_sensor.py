@@ -55,11 +55,11 @@ log_data_record_raw_data = True    # Record individual readings vs averaged data
 # Only ONE control method should be enabled at a time
 
 run_slow_control = False           # Basic voltage sweep control (0-1V linear ramp)
-run_pid_control = False            # PID control to maintain constant temperature
-run_pid_slow_control = True        # PID-assisted temperature ramping between setpoints
+run_pid_control = True            # PID control to maintain constant temperature
+run_pid_slow_control = False        # PID-assisted temperature ramping between setpoints
 
 # PID Control Parameters (for run_pid_control = True)
-pid_desired_temp = 17.3            # Target temperature in Celsius
+pid_desired_temp = 16.6            # Target temperature in Celsius
 pid_interval = 15                  # PID update interval in seconds
 
 # PID Slow Control Parameters (for run_pid_slow_control = True)
