@@ -38,11 +38,12 @@ from scipy.signal import find_peaks, find_peaks_cwt, savgol_filter, morlet
 
 # ---------------- BASIC DATA SETTINGS ----------------
 # What data are you analyzing?
-file_name = '0922_swing_top'  # CHANGE THIS: Name of your data directory/file prefix
+file_name = 'tempsweep092525'  # CHANGE THIS: Name of your data directory/file prefix
                                  # Script expects: {file_name}/waveform_files.csv OR {file_name}data.csv
                                  # And: {file_name}Tdata.csv (temperature data)
 
 # What type of data format do you have?
+files_are_txt = True            # True: Files are .txt and tab-separated rather than .csv
 temp_input_is_raw_data = True    # True: Temperature data needs smoothing (typical for recent data)
                                 # False: Temperature data is already processed
 use_channel_b = True            # True: Analyze both Channel A and B from PicoScope
@@ -53,8 +54,8 @@ plus_40_correction = True      # True: Add 40mV to Channel A data (baseline corr
 # ---------------- DISPLAY SETTINGS ----------------
 # What portion of data would you like to analyze and display?
 show_peak_lines = True          # True: Show vertical lines at detected peaks in plots
-start_time = 800               # Start time (seconds) for analysis window
-end_time = 2800                # End time (seconds) for analysis window
+start_time = 3600               # Start time (seconds) for analysis window
+end_time = 5800                # End time (seconds) for analysis window
 
 # ---------------- ADVANCED PROCESSING PARAMETERS ----------------
 # Fine-tune these if you understand the signal processing involved
@@ -65,7 +66,7 @@ half_life = 30                  # Time constant (seconds) for exponential smooth
                                # Smaller = less smoothing, larger = more smoothing
                                # Recommended: 30 (true value likely between 10-60)
 
-peak_prominence = 40            # Minimum peak height (mV) to be counted as a real peak
+peak_prominence = 0.5            # Minimum peak height (mV) to be counted as a real peak
                                # Increase if too many false peaks, decrease if missing real peaks
 
 # ============================================================================
@@ -159,8 +160,11 @@ else:
     directory_path = os.path.join(os.getcwd(), file_name)
     
     try:
-        # Find all CSV files in the data directory
-        test_files = [f for f in os.listdir(directory_path) if f.lower().endswith('.csv')]
+        # Find all files in the data directory
+        if files_are_txt:
+            test_files = [f for f in os.listdir(directory_path) if f.lower().endswith('.txt')]
+        else:
+            test_files = [f for f in os.listdir(directory_path) if f.lower().endswith('.csv')]
         
         if not test_files:
             raise FileNotFoundError(f"No CSV files found in directory: {directory_path}")
@@ -187,7 +191,10 @@ else:
             print(f"Processing file {file_idx + 1}/{len(all_files)}")
             
         file_path = os.path.join(directory_path, file)
-        initial_data = pd.read_csv(file_path)
+        if files_are_txt:
+            initial_data = pd.read_csv(file_path, sep="\t")
+        else:
+            initial_data = pd.read_csv(file_path)
 
         # Extract and clean time data
         strtimedata = initial_data['Time'].tolist()[2:]  # Skip header rows

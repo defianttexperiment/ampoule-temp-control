@@ -11,7 +11,7 @@ x_axis_3 = [16.80457618, 16.809532, 16.81488798, 16.81826531, 16.82101812, 16.82
 plt.ylabel("Change in density (%)")
 plt.xlabel("Temperature (°C)")
 
-show_lines = True
+show_lines = False
 
 if show_lines:
     plt.plot(x_axis_1, y_axis_1, color="green", label="z=0.41")
