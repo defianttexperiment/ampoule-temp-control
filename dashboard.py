@@ -29,11 +29,6 @@ print([attr for attr in dir(ps) if 'stream' in attr.lower()])
 # CONFIGURATION SECTION - Modify these parameters to customize system behavior
 # ================================================================================================
 
-# ---------------- HARDWARE CONFIGURATION ----------------
-load_dotenv()
-supply_port = os.getenv("SERIAL_PORT")     # USB port name that connects via RS232 to power supply
-fluke_port = "/dev/tty.usbserial-AV0L2AIU"
-
 # ---------------- PICOSCOPE CONFIGURATION ----------------
 enable_picoscope = True                     # Enable PicoScope data acquisition (photodiode light intensity)
 picoscope_channels = {
@@ -43,10 +38,12 @@ picoscope_channels = {
 # Available ranges: 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0 (volts). Coupling options: 'DC' or 'AC'
 
 sample_interval_us = 50    # Microseconds between samples (don't go above 50, Picoscope can't go that slow)
-picoscope_rms_window = 30  # Calculate RMS over 30 second window
+picoscope_rms_window = 30  # Window (seconds) for RMS calculation
+picoscope_display_window = 60   # Window (seconds) for Picoscope data displayed 
 
 # ---------------- DATA LOGGING CONFIGURATION ----------------
-log_data_average_interval = 15     # Number of readings to average for smoothed plotting (seconds)
+log_data_average_interval = 30     # Window (seconds) for temp & pressure averaging
+log_data_display_window = 120      # Window (seconds) for temp & pressure display
 log_data_record_raw_data = True    # Record individual readings vs averaged data in CSV
                                    # True = raw 1-second readings, False = averaged readings
 BIN_SIZE_SAMPLES = 1000            # Average every 1000 samples (50ms at 20kHz)
@@ -59,6 +56,11 @@ BIN_SIZE_SAMPLES = 1000            # Average every 1000 samples (50ms at 20kHz)
 ACTIVE_RTDS = {
     "RTD-1": {"channel": 3, "type": "PT100"}  # Example: PT100 on AIN3
 }
+
+# ---------------- HARDWARE CONFIGURATION ----------------
+load_dotenv()
+supply_port = os.getenv("SERIAL_PORT")     # USB port name that connects via RS232 to power supply
+fluke_port = "/dev/tty.usbserial-AV0L2AIU"
 
 # ================================================================================================
 # SYSTEM INITIALIZATION - Automatic configuration based on user settings
@@ -88,8 +90,6 @@ picoscope_rolling_data = {ch: [] for ch in picoscope_channels if picoscope_chann
 # PicoScope RMS data storage (for 30s rolling window)
 picoscope_rms_data = {ch: [] for ch in picoscope_channels if picoscope_channels[ch]['enabled']}
 picoscope_rms_rolling_data = {ch: [] for ch in picoscope_channels if picoscope_channels[ch]['enabled']}
-
-# After picoscope_rms_rolling_data definition, add:
 picoscope_binned_data = {ch: [] for ch in picoscope_channels if picoscope_channels[ch]['enabled']}
 picoscope_binned_times = {ch: [] for ch in picoscope_channels if picoscope_channels[ch]['enabled']}
 picoscope_bin_buffer = {ch: [] for ch in picoscope_channels if picoscope_channels[ch]['enabled']}
@@ -627,10 +627,10 @@ def collect_picoscope_data():
                         picoscope_binned_data[ch].append(bin_average)
                         picoscope_binned_times[ch].append(bin_timestamp)
                         
-                        # Limit to last 60 seconds of binned data (1200 points at 20Hz)
-                        if len(picoscope_binned_data[ch]) > 1200:
-                            picoscope_binned_data[ch].pop(0)
-                            picoscope_binned_times[ch].pop(0)
+                        # Limit to last picoscope_display_window seconds of binned data
+                        if len(picoscope_binned_data[ch]) > picoscope_display_window*20:
+                            picoscope_binned_data[ch] = picoscope_binned_data[ch][-picoscope_display_window*20:]
+                            picoscope_binned_times[ch] = picoscope_binned_times[ch][-picoscope_display_window*20:]
                     
                     # Update bin start time for next bin
                     picoscope_bin_start_time[ch] += BIN_SIZE_SAMPLES * SAMPLE_PERIOD
@@ -646,14 +646,15 @@ def collect_picoscope_data():
                 
                 with data_lock:
                     picoscope_rolling_data[ch].append(voltage)
-                    if len(picoscope_rolling_data[ch]) > log_data_average_interval:
+                    if len(picoscope_rolling_data[ch]) > log_data_display_window:
                         picoscope_rolling_data[ch].pop(0)
 
                     # Maintain RMS window with all samples
                     picoscope_rms_rolling_data[ch].extend(values)
-                    # Keep only last 30 seconds worth at 20kHz = 600,000 samples
-                    if len(picoscope_rms_rolling_data[ch]) > 600000:
-                        picoscope_rms_rolling_data[ch] = picoscope_rms_rolling_data[ch][-600000:]
+                    # Keep only last picoscope_rms_window seconds worth of data
+                    num_picoscope_samples = int(picoscope_rms_window*1000000/sample_interval_us)
+                    if len(picoscope_rms_rolling_data[ch]) > num_picoscope_samples:
+                        picoscope_rms_rolling_data[ch] = picoscope_rms_rolling_data[ch][-num_picoscope_samples:]
 
                     # Compute RMS and share
                     rms_value = np.sqrt(np.mean(np.square(picoscope_rms_rolling_data[ch])))
@@ -677,11 +678,8 @@ def log_data():
         supply: Power supply object for voltage/current measurements
     """
     global start_time
-    
-    # Adjust averaging interval for PID control compatibility
-    average_interval = log_data_average_interval
 
-    print(f"Data logging thread started with {average_interval}s averaging window")
+    print(f"Data logging thread started with {log_data_average_interval}s averaging window")
     
     while not exit_event.is_set():
         # Read all sensors
@@ -704,13 +702,13 @@ def log_data():
                 for rtd in ACTIVE_RTDS:
                     if rtd_temps and rtd in rtd_temps:
                         rtd_rolling_data[rtd].append(rtd_temps[rtd])
-                        if len(rtd_rolling_data[rtd]) > average_interval:
+                        if len(rtd_rolling_data[rtd]) > log_data_average_interval:
                             rtd_rolling_data[rtd].pop(0)
         
         # Store pressure for smoothing
         if pressure is not None:
             pressure_rolling_data.append(pressure)
-            if len(pressure_rolling_data) > log_data_average_interval:
+            if len(pressure_rolling_data) > log_data_display_window:
                 pressure_rolling_data.pop(0)
         
         # Smoothing/averaging - use mean instead of median
@@ -788,8 +786,8 @@ def log_data():
                     if ch in rms_picoscope:
                         picoscope_rms_data[ch].append(rms_picoscope[ch])
 
-                # Limit plotting data to last 10 mins for performance
-                if len(time_data) > 600:
+                # Limit plotting data to last log_data_display_window seconds
+                if len(time_data) > log_data_display_window*10:
                     time_data.pop(0)
                     for rtd in rtd_temp_data:
                         if rtd_temp_data[rtd]:
@@ -809,26 +807,6 @@ def log_data():
                 else:
                     pressure_data.append('')
                     pressure_std.append('')
-
-            # Print status to console
-            status_parts = []
-            if ACTIVE_RTDS and avg_rtd:
-                rtd_status = " | ".join([f"{rtd}: {avg_rtd[rtd]:.2f}" for rtd in avg_rtd])
-                status_parts.append(rtd_status)
-                
-            if avg_pressure is not None:
-                status_parts.append(f"Pressure: {avg_pressure:.3f} Bar")
-            
-            if enable_picoscope and avg_picoscope:
-                pico_status = " | ".join([f"Photodiode Ch{ch}: {avg_picoscope[ch]:.4f}V" for ch in avg_picoscope])
-                status_parts.append(pico_status)
-            
-            if enable_picoscope and rms_picoscope:
-                pico_rms_status = " | ".join([f"Ch{ch} RMS: {rms_picoscope[ch]:.4f}V" for ch in rms_picoscope])
-                status_parts.append(pico_rms_status)
-                
-            if status_parts:
-                print(f"[{timestamp_str}] " + " || ".join(status_parts))
             
             # Write to CSV file
             write_to_csv(timestamp_str, current_time, current_rtd,
@@ -927,7 +905,7 @@ def update_temperature_plot(frame):
     ax_temp.grid(True, alpha=0.3)
     
     if time_data:
-        ax_temp.set_xlim(max(0, time_data[-1] - 300), time_data[-1] + 10)
+        ax_temp.set_xlim(max(0, time_data[-1] - log_data_display_window), time_data[-1] + 1)
 
 
 def update_pressure_plot(frame):
@@ -967,7 +945,7 @@ def update_pressure_plot(frame):
     ax_pressure.grid(True, alpha=0.3)
     
     if time_data:
-        ax_pressure.set_xlim(max(0, time_data[-1] - 300), time_data[-1] + 10)
+        ax_pressure.set_xlim(max(0, time_data[-1] - log_data_display_window), time_data[-1] + 1)
 
 
 def update_picoscope_raw_plot(frame):
@@ -1000,7 +978,7 @@ def update_picoscope_raw_plot(frame):
             
             if all_times:
                 latest_time = max(all_times)
-                ax_pico_raw.set_xlim(max(0, latest_time - 60), latest_time + 1)
+                ax_pico_raw.set_xlim(max(0, latest_time - picoscope_display_window), latest_time + 1)
 
     # Format plot appearance
     ax_pico_raw.set_xlabel("Time (s)")
@@ -1038,7 +1016,7 @@ def update_picoscope_rms_plot(frame):
     ax_pico_rms.grid(True, alpha=0.3)
     
     if time_data:
-        ax_pico_rms.set_xlim(max(0, time_data[-1] - 300), time_data[-1] + 10)
+        ax_pico_rms.set_xlim(max(0, time_data[-1] - log_data_display_window), time_data[-1] + 1)
 
 if __name__ == "__main__":
     """
