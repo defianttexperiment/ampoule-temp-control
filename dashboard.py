@@ -44,23 +44,22 @@ picoscope_display_window = 60   # Window (seconds) for Picoscope data displayed
 # ---------------- DATA LOGGING CONFIGURATION ----------------
 log_data_average_interval = 30     # Window (seconds) for temp & pressure averaging
 log_data_display_window = 120      # Window (seconds) for temp & pressure display
-log_data_record_raw_data = True    # Record individual readings vs averaged data in CSV
-                                   # True = raw 1-second readings, False = averaged readings
-BIN_SIZE_SAMPLES = 1000            # Average every 1000 samples (50ms at 20kHz)
+log_data_record_raw_data = True    # Record raw readings in CSV (false = records averaged data)
+BIN_SIZE_SAMPLES = 1000            # Number of samples to average
+                                   # BIN_SIZE_SAMPLES*sample_interval_us = bin sizes in µs. 50 & 1000 gives 20Hz
 
 # ---------------- SENSOR CONFIGURATION ----------------
 # Define which sensors are connected and active
 
-# Format: "Display Name": {"channel": AIN_number, "type": rtd_type}
-# Types: "PT100", "PT500", "PT1000"
+# Format: "Display Name": {"pos_channel": AIN_number, "neg_channel": AIN_number, "type": "PT100"}
 ACTIVE_RTDS = {
-    "RTD-1": {"channel": 3, "type": "PT100"}  # Example: PT100 on AIN3
+    "RTD-1": {"pos_channel": 1, "neg_channel": 0, "type": "PT100"}
 }
 
 # ---------------- HARDWARE CONFIGURATION ----------------
 load_dotenv()
-supply_port = os.getenv("SERIAL_PORT")     # USB port name that connects via RS232 to power supply
-fluke_port = "/dev/tty.usbserial-AV0L2AIU"
+supply_port = os.getenv("SERIAL_PORT")
+fluke_port = os.getenv("FLUKE_PORT")
 
 # ================================================================================================
 # SYSTEM INITIALIZATION - Automatic configuration based on user settings
@@ -445,8 +444,9 @@ def configure_rtd(handle):
     """
     print("Configuring RTD sensors...")
     for name, config in ACTIVE_RTDS.items():
-        ain_channel = config["channel"]
-        rtd_type = config["type"]  # "PT100", "PT500", or "PT1000"
+        pos_channel = config["pos_channel"]
+        neg_channel = config["neg_channel"]
+        rtd_type = config["type"]
         
         # Map RTD type to resistance value for EF_CONFIG_A
         rtd_resistance_map = {
@@ -455,26 +455,19 @@ def configure_rtd(handle):
             "PT1000": 1000
         }
         
-        if rtd_type not in rtd_resistance_map:
-            print(f"  ⚠️ Warning: Unknown RTD type '{rtd_type}' for {name}, skipping")
-            continue
-        
-        resistance = rtd_resistance_map[rtd_type]
-        
-        # Set input range
-        ljm.eWriteName(handle, f"AIN{ain_channel}_RANGE", 1.0)
-        # Set high resolution for precise measurement
-        ljm.eWriteName(handle, f"AIN{ain_channel}_RESOLUTION_INDEX", 12)
-        range_readback = ljm.eReadName(handle, f"AIN{ain_channel}_RANGE")
-        print(f"  AIN{ain_channel} range set to: {range_readback}V")
-        
-        # Configure extended feature for RTD processing
-        # Extended Feature Index 40 = RTD
-        ljm.eWriteName(handle, f"AIN{ain_channel}_EF_INDEX", 40)
-        ljm.eWriteName(handle, f"AIN{ain_channel}_EF_CONFIG_A", 1)  # Output in °C
-        ljm.eWriteName(handle, f"AIN{ain_channel}_EF_CONFIG_B", 0)  # Excitation circuit 0, 200 µA source
-        
-        print(f"  Configured {name} RTD ({rtd_type}) on AIN{ain_channel}")
+        # Set input range & resolution
+        print(1)
+        ljm.eWriteName(handle, f"AIN{pos_channel}_RANGE", 0.1)
+        print(2)
+        ljm.eWriteName(handle, f"AIN{pos_channel}_RESOLUTION_INDEX", 12) # 12 = 24-bit, most precise
+        print(3)
+
+        ljm.eWriteName(handle, f"AIN{neg_channel}_RANGE", 0.1)
+        print(1)
+        ljm.eWriteName(handle, f"AIN{neg_channel}_RESOLUTION_INDEX", 12) # 12 = 24-bit, most precise
+        print(2)
+
+        print(f"  Configured {name} RTD ({rtd_type}) on AIN{pos_channel} and AIN{neg_channel}")
 
 # ================================================================================================
 # SENSOR READING FUNCTIONS - Acquire data from hardware
@@ -498,9 +491,13 @@ def read_temp_sensors():
         # Read RTD temperatures using extended features
         rtd_temps = {}
         for name, config in ACTIVE_RTDS.items():
-            channel = config['channel']
+            pos_channel = config['pos_channel']
+            neg_channel = config['neg_channel']
             # Read processed temperature from extended feature
-            temp = ljm.eReadName(handle, f"AIN{channel}_EF_READ_A")
+            pos_voltage = ljm.eReadName(handle, f"AIN{pos_channel}")
+            neg_voltage = ljm.eReadName(handle, f"AIN{neg_channel}")
+            resistance = (pos_voltage - neg_voltage)/0.0002 # R = V/I, I = 200 µA
+            temp = 20 + (resistance-107.794)/0.385
             rtd_temps[name] = temp
         
         ljm.close(handle)  # Clean up connection
@@ -567,7 +564,7 @@ def read_pressure_sensor():
             return pressure
 
     except serial.SerialException as e:
-        print(f"⚠️ Serial error: {e}")
+        # print(f"⚠️ Serial error: {e}")
         return None
     
 # ================================================================================================
