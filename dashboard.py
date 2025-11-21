@@ -11,59 +11,161 @@ from labjack import ljm
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import numpy as np
+from scipy.signal import find_peaks
 from collections import deque
 from datetime import datetime
 from rscomm import *
 from dotenv import load_dotenv
-
-# PicoScope imports
 from picosdk.ps2000 import ps2000 as ps
 from picosdk.functions import adc2mV, assert_pico_ok
 from picosdk.PicoDeviceEnums import picoEnum
 from picosdk.ctypes_wrapper import C_CALLBACK_FUNCTION_FACTORY
 import ctypes
 
-print([attr for attr in dir(ps) if 'stream' in attr.lower()])
+load_dotenv()
+
+"""
+This function collects and displays data from our RTDs (temperature), FLUKE (pressure), Picoscope (fringes/raw & scattering/RMS), and octopus (humidity/temperature).
+
+HARDWARE SETUP:
+1. Connect the Labjack via USB to the computer.
+2. Connect the FLUKE pressure sensor via USB to the computer.
+3. Connect the Picoscope via USB to the computer, and connect BNC wires from each photodiode to the Picoscope.
+4. Connect RTD wires to the Labjack and to each other:
+    200µA — Red RTD-2
+    AIN3 — Red RTD-2
+        (RTD-2 resistor, ~100 ohms)
+    AIN2 — White RTD-2
+        (Red RTD-1 — White RTD-2, soldered & covered to avoid shorting)
+    AIN1 — Red RTD-1
+        (RTD-1 resistor, ~100 ohms)
+    AIN0 — White RTD-1
+    GND — White RTD-1
+5. Connect photodiode bias modules to the Labjack.
+    VS — VCC (red)
+    GND — GND (black)
+6. Connect the octopus sensor to the Labjack.
+    FIO0 — Signal (yellow)
+    VS — VCC (red)
+    GND — GND (black)
+
+VIRTUAL SETUP:
+1. This function requires the old Intel architecture rather than the new Apple Silicon hardware. 
+    To resolve this, we use a Conda environment to emulate the old hardware.
+    TODO: Use "conda activate dashboard" on the lab computer to activate the Conda environment.
+2. This function requires a .env file to have the port name for serial communication with the FLUKE pressure sensor, 
+    as well as degree offsets for each RTD as determined by our calibration.
+    TODO: Create a .env file in the same directory as this script with the following contents:
+    FLUKE_PORT = "/dev/tty.usbserial-AV0L2AIU"
+    RTD_1_OFFSET = 3.194
+    RTD_2_OFFSET = 3.084
+    or the appropriate port name for the computer and the offsets for the sensors.
+
+CONFIGURATION:
+The following configuration options are available to the user:
+- Turning on/off each data stream.
+- Adding RTDs and their Labjack AIN ports.
+- Adding Picoscope channels, as well as which channels go to raw data vs RMS data.
+- Adding an octopus sensor and its FIO port.
+
+- Changing the sampling intervals for each data stream.
+- Changing the averaging and RMS intervals for each data stream, 
+    or removing the averaging entirely and displaying raw data.
+- Changing the threshold for Picoscope fringe detection.
+
+- Changing the display windows for each data stream.
+- Changing the display rates for each data stream.
+
+COMMON ERRORS:
+- Some error related to DYLD_LIBRARY_PATH:
+    The Picoscope SDK requires a specific library path to be set.
+    Type this script into the terminal and try again:
+    export DYLD_LIBRARY_PATH="/Applications/PicoScope 7 T&M.app/Contents/Resources:$DYLD_LIBRARY_PATH"
+- Labjack not connecting:
+    Check whether it is powered on (the green light is on); it most likely is not.
+    There is likely a short with one of the Picoscope power wires, or another electrical issue.
+    If the issue persists, set enable_temperature = False.
+- Picoscope not connecting:
+    Check whether Picoscope 7 is open. The device can't connect to multiple programs at once.
+    Most issues with sensors not connecting/opening can be resolved by running the program again.
+"""
 
 # ================================================================================================
-# CONFIGURATION SECTION - Modify these parameters to customize system behavior
+# CONFIGURE SETUP
 # ================================================================================================
 
-# ---------------- PICOSCOPE CONFIGURATION ----------------
-enable_picoscope = True                     # Enable PicoScope data acquisition (photodiode light intensity)
-picoscope_channels = {
+# ---------------- ENABLE FUNCTIONS - Turn data streams on/off ----------------
+enable_temperature = True
+enable_pressure = True
+enable_picoscope = True
+enable_octopus = True
+
+# ---------------- SENSOR CONFIGURATION - Choose which sensors are set up ----------------
+# Temperature configuration
+ACTIVE_RTDS = { # Format: "Display Name": {"pos_channel": AIN_number, "neg_channel": AIN_number, "type": "PT100", "offset": offset_value}
+    "RTD-1": {"pos_channel": 1, "neg_channel": 0, "type": "PT100", 
+              "offset": float(os.getenv("RTD_1_OFFSET"))},
+    "RTD-2": {"pos_channel": 3, "neg_channel": 2, "type": "PT100", 
+              "offset": float(os.getenv("RTD_2_OFFSET"))}
+} # If RTDs are not active, comment them out rather than deleting them
+
+# Pressure configuration: The USB port that this is connected to should be defined as FLUKE_PORT in your .env file. 
+# Default: FLUKE_PORT = "/dev/tty.usbserial-AV0L2AIU"
+
+# Picoscope configuration
+picoscope_channels = { # Available ranges: 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0 (volts). Coupling options: 'DC' or 'AC'
     'A': {'enabled': True, 'range': 10.0, 'coupling': 'DC'},
     'B': {'enabled': False, 'range': 10.0, 'coupling': 'DC'}
 }
-# Available ranges: 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0 (volts). Coupling options: 'DC' or 'AC'
+picoscope_raw_channels = ['A'] # Channels to log raw data from (i.e., measuring fringes)
+picoscope_rms_channels = ['A'] # Channels to log RMS data from (i.e., measuring scattering)
 
-sample_interval_us = 50    # Microseconds between samples (don't go above 50, Picoscope can't go that slow)
-picoscope_rms_window = 30  # Window (seconds) for RMS calculation
-picoscope_display_window = 60   # Window (seconds) for Picoscope data displayed 
+# Octopus configuration
+octopus_fio_channel = 0  # FIO channel for octopus sensor wire
 
-# ---------------- DATA LOGGING CONFIGURATION ----------------
-log_data_average_interval = 30     # Window (seconds) for temp & pressure averaging
-log_data_display_window = 120      # Window (seconds) for temp & pressure display
-log_data_record_raw_data = True    # Record raw readings in CSV (false = records averaged data)
-BIN_SIZE_SAMPLES = 1000            # Number of samples to average
-                                   # BIN_SIZE_SAMPLES*sample_interval_us = bin sizes in µs. 50 & 1000 gives 20Hz
+# ================================================================================================
+# CONFIGURE PROCESSING & DISPLAY
+# ================================================================================================
 
-# ---------------- SENSOR CONFIGURATION ----------------
-# Define which sensors are connected and active
+# ---------------- TEMPERATURE ----------------
+temperature_sample_interval = 0.2       # Interval (seconds) between samples
+temperature_average_interval = 5      # Window (seconds) for which samples are averaged
+temperature_display_window = 60       # Window (seconds) for which data is displayed
+temperature_display_raw_data = False  # Display raw readings on graph (false = displays averaged data)
+temperature_record_raw_data = True    # Record raw readings in CSV (false = records averaged data)
 
-# Format: "Display Name": {"pos_channel": AIN_number, "neg_channel": AIN_number, "type": "PT100"}
-ACTIVE_RTDS = {
-    "RTD-1": {"pos_channel": 1, "neg_channel": 0, "type": "PT100"}
-}
+# ---------------- PRESSURE ----------------
+pressure_sample_interval = 0.2        # Interval (seconds) between samples
+pressure_average_interval = 30        # Window (seconds) for which samples are averaged
+pressure_display_window = 60          # Window (seconds) for which data is displayed
+pressure_display_raw_data = False     # Display raw readings on graph (false = displays averaged data)
+pressure_record_raw_data = True       # Record raw readings in CSV (false = records averaged data)
 
-# ---------------- HARDWARE CONFIGURATION ----------------
-load_dotenv()
-supply_port = os.getenv("SERIAL_PORT")
-fluke_port = os.getenv("FLUKE_PORT")
+# ---------------- PICOSCOPE ----------------
+picoscope_data_update_interval = 0.2  # Interval (seconds) between data updates
+picoscope_sample_interval_us = 50               # Microseconds between samples (don't go above 50, Picoscope can't go that slow)
+picoscope_display_window = 60         # Window (seconds) for Picoscope data displayed 
+picoscope_bin_size = 1000               # Number of samples to average for raw data. picoscope_bin_size*picoscope_sample_interval_us = bin sizes in us. 50 & 1000 gives 20Hz
+picoscope_rms_window = 30             # Window (seconds) for RMS calculation
+fringe_voltage_threshold = 0.05       # Minimum voltage (V) for fringe detection
+
+# ---------------- BACKEND ----------------
+csv_write_interval = 1                # Interval (seconds) between CSV writes
+
+
+
+
+
+# ================================================================================================
+# PROGRAM BEGINS
+# ================================================================================================
 
 # ================================================================================================
 # SYSTEM INITIALIZATION - Automatic configuration based on user settings
 # ================================================================================================
+
+# Load USB port names from .env
+fluke_port = os.getenv("FLUKE_PORT")
 
 # Generate unique filename with timestamp for data logging
 timestamp = datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
@@ -74,26 +176,29 @@ print(f"Data will be logged to: {csv_filename}")
 # DATA STRUCTURES - Storage for sensor data and system state
 # ================================================================================================
 
-# Live plotting data storage - keeps recent data in memory for real-time display
-time_data = []  # Time points for x-axis
-rtd_temp_data = {rtd: [] for rtd in ACTIVE_RTDS}  # RTD temperature history
-rtd_temp_std = {rtd: [] for rtd in ACTIVE_RTDS}  # RTD temperature standard deviation
-voltage_data = []      # Power supply voltage history
-current_data = []      # Power supply current history
+temperature_time_data = []  # Time points for x-axis
+temperature_data = {rtd: [] for rtd in ACTIVE_RTDS}
+temperature_average_data = {rtd: [] for rtd in ACTIVE_RTDS}
+temperature_std_data = {rtd: [] for rtd in ACTIVE_RTDS}
+pressure_time_data = []
+pressure_data = []
+pressure_average_data = []
+pressure_std_data = []
 start_time = time.time()  # Program start timestamp for relative timing
 
-# PicoScope data storage
-picoscope_data = {ch: [] for ch in picoscope_channels if picoscope_channels[ch]['enabled']}
-picoscope_rolling_data = {ch: [] for ch in picoscope_channels if picoscope_channels[ch]['enabled']}
+picoscope_time_data = []
+picoscope_time_rolling_data = []
+picoscope_data = {ch: [] for ch in picoscope_raw_channels if picoscope_channels[ch]['enabled']}
+picoscope_rolling_data = {ch: [] for ch in picoscope_raw_channels if picoscope_channels[ch]['enabled']}
+picoscope_rms_data = {ch: [] for ch in picoscope_rms_channels if picoscope_channels[ch]['enabled']}
+picoscope_rms_rolling_data = {ch: [] for ch in picoscope_rms_channels if picoscope_channels[ch]['enabled']}
+picoscope_time_rolling_data = []
 
-# PicoScope RMS data storage (for 30s rolling window)
-picoscope_rms_data = {ch: [] for ch in picoscope_channels if picoscope_channels[ch]['enabled']}
-picoscope_rms_rolling_data = {ch: [] for ch in picoscope_channels if picoscope_channels[ch]['enabled']}
-picoscope_binned_data = {ch: [] for ch in picoscope_channels if picoscope_channels[ch]['enabled']}
-picoscope_binned_times = {ch: [] for ch in picoscope_channels if picoscope_channels[ch]['enabled']}
-picoscope_bin_buffer = {ch: [] for ch in picoscope_channels if picoscope_channels[ch]['enabled']}
-picoscope_bin_start_time = {ch: None for ch in picoscope_channels if picoscope_channels[ch]['enabled']}
-SAMPLE_PERIOD = sample_interval_us / 1_000_000  # Convert microseconds to seconds
+picoscope_binned_data = {ch: [] for ch in picoscope_raw_channels if picoscope_channels[ch]['enabled']}
+picoscope_binned_times = {ch: [] for ch in picoscope_raw_channels if picoscope_channels[ch]['enabled']}
+picoscope_bin_buffer = {ch: [] for ch in picoscope_raw_channels if picoscope_channels[ch]['enabled']}
+picoscope_bin_start_time = {ch: None for ch in picoscope_raw_channels if picoscope_channels[ch]['enabled']}
+picoscope_sample_period = picoscope_sample_interval_us / 1_000_000  # Convert microseconds to seconds
 
 class SharedData:
     """
@@ -112,83 +217,151 @@ class SharedData:
     """
     
     def __init__(self):
-        self.lock = threading.Lock()  # Prevents simultaneous access from multiple threads
-        self.current_temp = None      # None indicates no data available yet
-        self.avg_rtd = {}             # Averaged RTD data by sensor name
-        self.current_voltage = None   # Latest voltage reading
-        self.current_current = None   # Latest current reading
-        self.current_pressure = None  # Latest pressure reading
-        self.picoscope_voltages = {}  # Latest PicoScope readings
+        self.lock = threading.Lock()
 
-    def update_temperature(self, temp,  avg_rtd_data):
-        """Update temperature data in thread-safe manner."""
-        with self.lock:
-            self.current_temp = temp
-            self.avg_rtd = avg_rtd_data.copy()
+        # Temperature data
+        self.temp_time_data = []
+        self.temp_data = {rtd: [] for rtd in ACTIVE_RTDS}
+        self.temp_average_data = {rtd: [] for rtd in ACTIVE_RTDS}
+        self.temp_std_data = {rtd: [] for rtd in ACTIVE_RTDS}
 
-    def update_voltage(self, voltage):
-        """Update voltage measurement in thread-safe manner."""
-        with self.lock:
-            self.current_voltage = voltage
+        self.temp_time_rolling_data = []
+        self.temp_rolling_data = {rtd: [] for rtd in ACTIVE_RTDS}
+        self.temp_average_rolling_data = {rtd: [] for rtd in ACTIVE_RTDS}
+        self.temp_std_rolling_data = {rtd: [] for rtd in ACTIVE_RTDS}
 
-    def update_current(self, current):
-        """Update current measurement in thread-safe manner."""
-        with self.lock:
-            self.current_current = current
-    
-    def update_pressure(self, pressure):
-        """Update pressure measurement in thread-safe manner."""
-        with self.lock:
-            self.current_pressure = pressure
-    
-    def update_picoscope(self, channel, voltage):
-        """Update PicoScope voltage measurement in thread-safe manner."""
-        with self.lock:
-            self.picoscope_voltages[channel] = voltage
-    
-    def get_temperature(self):
-        """Get current temperature reading (thread-safe)."""
-        with self.lock:
-            return self.current_temp
+        # Pressure data
+        self.pressure_time_data = []
+        self.pressure_data = []
+        self.pressure_average_data = []
+        self.pressure_std_data = []
 
-    def get_avg_temperature(self):
-        """Get average of all active sensor readings (thread-safe)."""
+        self.pressure_time_rolling_data = []
+        self.pressure_rolling_data = []
+        self.pressure_average_rolling_data = []
+        self.pressure_std_rolling_data = []
+
+        # PicoScope data
+        self.picoscope_raw_time_data = {ch: [] for ch in picoscope_raw_channels if picoscope_channels[ch]['enabled']}
+        self.picoscope_raw_data = {ch: [] for ch in picoscope_raw_channels if picoscope_channels[ch]['enabled']}
+        self.picoscope_rms_time_data = {ch: [] for ch in picoscope_rms_channels if picoscope_channels[ch]['enabled']}
+        self.picoscope_rms_data = {ch: [] for ch in picoscope_rms_channels if picoscope_channels[ch]['enabled']}
+        self.picoscope_peak_times = {ch: [] for ch in picoscope_raw_channels if picoscope_channels[ch]['enabled']}
+
+        self.picoscope_raw_time_rolling_data = {ch: [] for ch in picoscope_raw_channels if picoscope_channels[ch]['enabled']}
+        self.picoscope_raw_rolling_data = {ch: [] for ch in picoscope_raw_channels if picoscope_channels[ch]['enabled']}
+        self.picoscope_rms_time_rolling_data = {ch: [] for ch in picoscope_rms_channels if picoscope_channels[ch]['enabled']}
+        self.picoscope_rms_rolling_data = {ch: [] for ch in picoscope_rms_channels if picoscope_channels[ch]['enabled']}
+
+        self.octopus_temperature = 0
+        self.octopus_humidity = 0
+
+    def update_temperature(self, new_time_data, new_temp_data, new_average_data, new_std_data):
         with self.lock:
-            all_temps = []
-            if self.avg_rtd:
-                all_temps.extend(self.avg_rtd.values())
+            self.temp_time_data.append(new_time_data)
+            self.temp_time_rolling_data.append(new_time_data)
+            for rtd in ACTIVE_RTDS:
+                self.temp_data[rtd].append(new_temp_data[rtd])
+                self.temp_average_data[rtd].append(new_average_data[rtd])
+                self.temp_std_data[rtd].append(new_std_data[rtd])
+                
+                self.temp_rolling_data[rtd].append(new_temp_data[rtd])
+                self.temp_average_rolling_data[rtd].append(new_average_data[rtd])
+                self.temp_std_rolling_data[rtd].append(new_std_data[rtd])
             
-            if all_temps:
-                return np.mean(all_temps)  # Changed from median to mean
-            return None
-    
-    def get_all_data(self):
-        """Get complete snapshot of all temperature data (thread-safe)."""
+            # Trim rolling data to display window
+            max_samples = int(temperature_display_window / temperature_sample_interval)
+            if len(self.temp_time_rolling_data) > max_samples:
+                self.temp_time_rolling_data = self.temp_time_rolling_data[-max_samples:]
+                for rtd in ACTIVE_RTDS:
+                    self.temp_rolling_data[rtd] = self.temp_rolling_data[rtd][-max_samples:]
+                    self.temp_average_rolling_data[rtd] = self.temp_average_rolling_data[rtd][-max_samples:]
+                    self.temp_std_rolling_data[rtd] = self.temp_std_rolling_data[rtd][-max_samples:]
+
+    def update_pressure(self, new_time_data, new_pressure_data, new_average_data, new_std_data):
         with self.lock:
-            return (self.current_temp,
-                   self.avg_rtd.copy(), self.current_pressure, 
-                   self.picoscope_voltages.copy())
+            self.pressure_time_data.append(new_time_data)
+            self.pressure_data.append(new_pressure_data)
+            self.pressure_average_data.append(new_average_data)
+            self.pressure_std_data.append(new_std_data)
+            
+            self.pressure_time_rolling_data.append(new_time_data)
+            self.pressure_rolling_data.append(new_pressure_data)
+            self.pressure_average_rolling_data.append(new_average_data)
+            self.pressure_std_rolling_data.append(new_std_data)
+            
+            # Trim rolling data to display window
+            max_samples = int(pressure_display_window / pressure_sample_interval)
+            if len(self.pressure_time_rolling_data) > max_samples:
+                self.pressure_time_rolling_data = self.pressure_time_rolling_data[-max_samples:]
+                self.pressure_rolling_data = self.pressure_rolling_data[-max_samples:]
+                self.pressure_average_rolling_data = self.pressure_average_rolling_data[-max_samples:]
+                self.pressure_std_rolling_data = self.pressure_std_rolling_data[-max_samples:]
     
-    def get_picoscope_rms(self, channel):
-        """Get RMS value for PicoScope channel (thread-safe)."""
+    def update_picoscope_raw(self, channel, new_time_data, new_raw_data):
         with self.lock:
-            return self.picoscope_voltages.get(f"{channel}_rms", None)
+            # FIXED: Append to channel-specific lists
+            self.picoscope_raw_time_data[channel].append(new_time_data)
+            self.picoscope_raw_data[channel].append(new_raw_data)
+            
+            self.picoscope_raw_time_rolling_data[channel].append(new_time_data)
+            self.picoscope_raw_rolling_data[channel].append(new_raw_data)
+            
+            # Trim rolling data
+            max_samples = int(picoscope_display_window * 1000000 / (picoscope_bin_size * picoscope_sample_interval_us))
+            if len(self.picoscope_raw_time_rolling_data[channel]) > max_samples:
+                self.picoscope_raw_time_rolling_data[channel] = self.picoscope_raw_time_rolling_data[channel][-max_samples:]
+                self.picoscope_raw_rolling_data[channel] = self.picoscope_raw_rolling_data[channel][-max_samples:]
+        
+            # Detect peaks in the raw data
+            peaks, _ = find_peaks(self.picoscope_raw_data[channel][max(0,len(self.picoscope_raw_data[channel])-3*max_samples):], height=fringe_voltage_threshold)
+            peak_times = [self.picoscope_raw_time_data[channel][i] for i in peaks]
+            self.picoscope_peak_times[channel] = peak_times
+
     
-    def update_picoscope_rms(self, channel, rms_value):
-        """Update PicoScope RMS value in thread-safe manner."""
+    def update_picoscope_rms(self, channel, new_time_data, new_rms_data):
         with self.lock:
-            self.picoscope_voltages[f"{channel}_rms"] = rms_value
+            # FIXED: Append to channel-specific lists
+            self.picoscope_rms_time_data[channel].append(new_time_data)
+            self.picoscope_rms_data[channel].append(new_rms_data)
+            
+            self.picoscope_rms_time_rolling_data[channel].append(new_time_data)
+            self.picoscope_rms_rolling_data[channel].append(new_rms_data)
+            
+            # Trim rolling data
+            max_samples = int(picoscope_rms_window / picoscope_data_update_interval)
+            if len(self.picoscope_rms_time_rolling_data[channel]) > max_samples:
+                self.picoscope_rms_time_rolling_data[channel] = self.picoscope_rms_time_rolling_data[channel][-max_samples:]
+                self.picoscope_rms_rolling_data[channel] = self.picoscope_rms_rolling_data[channel][-max_samples:]
+
+    def update_octopus(self, temperature, humidity):
+        with self.lock:
+            self.octopus_temperature = temperature
+            self.octopus_humidity = humidity
+
+    
+    def get_temperature_rolling_data(self):
+        with self.lock:
+            return self.temp_time_rolling_data, self.temp_rolling_data, self.temp_average_rolling_data, self.temp_std_rolling_data
+        
+    def get_pressure_rolling_data(self):
+        with self.lock:
+            return self.pressure_time_rolling_data, self.pressure_rolling_data, self.pressure_average_rolling_data, self.pressure_std_rolling_data
+        
+    def get_picoscope_raw_rolling_data(self):
+        with self.lock:
+            return self.picoscope_raw_time_rolling_data, self.picoscope_raw_rolling_data, self.picoscope_peak_times
+    
+    def get_picoscope_rms_rolling_data(self):
+        with self.lock:
+            return self.picoscope_rms_time_rolling_data, self.picoscope_rms_rolling_data
+        
+    def get_octopus_data(self):
+        with self.lock:
+            return self.octopus_temperature, self.octopus_humidity
 
 # Create global shared data instance
 shared_data = SharedData()
-
-# Rolling data storage for averaging - keeps recent readings for smoothing
-rtd_rolling_data = {rtd: [] for rtd in ACTIVE_RTDS}  # RTD rolling data for averaging
-
-# Add rolling buffer for pressure for smoothing/plotting
-pressure_data = []  # List[float]: pressure values matching time_data
-pressure_std = []   # List[float]: pressure standard deviation values
-pressure_rolling_data = [] # list of the most recent values (for smoothing)
 
 # Thread synchronization objects
 data_lock = threading.Lock()  # Protects plotting data
@@ -199,29 +372,29 @@ exit_event = threading.Event()  # Signals all threads to stop
 # ================================================================================================
 
 def create_csv_file():
-    """Create CSV file with headers based on active sensors and configuration."""
-    headers = ["Timestamp (HH-MM-SS)", "Time (s)"]
+    """Create CSV file with headers for all enabled sensors."""
+    headers = ["Timestamp", "Time(s)"]
     
-    # Add mean and std dev columns for each RTD
-    for rtd in ACTIVE_RTDS:
-        headers.extend([f"{rtd} RTD Mean (°C)", f"{rtd} RTD StdDev (°C)"])
-    
-    # Add mean and std dev for pressure
-    headers.extend(["Pressure Mean (Bar)", "Pressure StdDev (Bar)"])
-    
-    # Add PicoScope raw columns
+    if enable_temperature:
+        for rtd in ACTIVE_RTDS:
+            headers.extend([f"{rtd}_Temp(C)"])
+
+    if enable_pressure:
+        headers.extend(["Pressure(Bar)"])
+
     if enable_picoscope:
-        for ch in picoscope_channels:
+        for ch in picoscope_raw_channels:
             if picoscope_channels[ch]['enabled']:
-                headers.append(f"Photodiode Ch{ch} Raw (V)")
-    
-    # Add PicoScope RMS columns
+                headers.append(f"Pico_Ch{ch}_Raw(V)")
+
     if enable_picoscope:
-        for ch in picoscope_channels:
+        for ch in picoscope_rms_channels:
             if picoscope_channels[ch]['enabled']:
-                headers.append(f"Photodiode Ch{ch} RMS (V)")
+                headers.append(f"Pico_Ch{ch}_RMS(V)")
     
-    # Create file and write headers
+    if enable_octopus:
+        headers.extend(["Octopus_Temp(C)", "Octopus_Humidity(%)"])
+    
     with open(csv_filename, mode="w", newline="") as file:
         writer = csv.writer(file)
         writer.writerow(headers)
@@ -229,8 +402,74 @@ def create_csv_file():
 # Initialize CSV file
 create_csv_file()
 
+def write_csv_row():
+    """
+    Write a single row to CSV with latest values from all sensors.
+    Uses shared_data to get most recent measurements.
+    """
+    try:
+        current_time = time.time()
+        relative_time = current_time - start_time
+        
+        row = [f"{current_time:.3f}", f"{relative_time:.3f}"]
+        
+        with data_lock:
+            # Temperature data
+            if enable_temperature:
+                for rtd in ACTIVE_RTDS:
+                    if len(shared_data.temp_average_data[rtd]) > 0:
+                        row.append(f"{shared_data.temp_average_data[rtd][-1]:.4f}")
+                    else:
+                        row.extend([''])
+            
+            # Pressure data
+            if enable_pressure:
+                if len(shared_data.pressure_average_data) > 0:
+                    row.append(f"{shared_data.pressure_average_data[-1]:.6f}")
+                else:
+                    row.extend([''])
+            
+            # PicoScope raw data
+            if enable_picoscope:
+                for ch in picoscope_raw_channels:
+                    if picoscope_channels[ch]['enabled']:
+                        if ch in shared_data.picoscope_raw_data and len(shared_data.picoscope_raw_data[ch]) > 0:
+                            row.append(f"{shared_data.picoscope_raw_data[ch][-1]:.6f}")
+                        else:
+                            row.append('')
+            
+            # PicoScope RMS data
+            if enable_picoscope:
+                for ch in picoscope_rms_channels:
+                    if picoscope_channels[ch]['enabled']:
+                        if ch in shared_data.picoscope_rms_data and len(shared_data.picoscope_rms_data[ch]) > 0:
+                            row.append(f"{shared_data.picoscope_rms_data[ch][-1]:.6f}")
+                        else:
+                            row.append('')
+            
+            # Octopus data (would need to add to SharedData class)
+            if enable_octopus:
+                # Add octopus_temp and octopus_humidity to SharedData first
+                # For now, placeholder:
+                row.extend(['', ''])
+        
+        with open(csv_filename, mode="a", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(row)
+            
+    except Exception as e:
+        print(f"CSV write error: {e}")
+
+def csv_writer_thread():
+    """Dedicated thread for writing data to CSV at regular intervals."""
+    print(f"CSV writer thread started (interval: {csv_write_interval}s)")
+    
+    while not exit_event.is_set():
+        time.sleep(csv_write_interval)
+        write_csv_row()
+
 # ================================================================================================
-# PICOSCOPE FUNCTIONS - PicoScope 2205A configuration and data acquisition
+# SENSOR CLASSES
 # ================================================================================================
 
 class PicoScopeReader:
@@ -313,7 +552,7 @@ class PicoScopeReader:
 
     # ----------------------------------------------------
 
-    def start_streaming(self, sample_interval_us=1000):
+    def start_streaming(self, picoscope_sample_interval_us=1000):
         """Start PicoScope streaming using ps2000_run_streaming_ns."""
         try:
             if self.streaming:
@@ -339,7 +578,7 @@ class PicoScopeReader:
 
             # Start streaming using run_streaming_ns (nanosecond version)
             # Parameters: handle, sample_interval, time_unit, max_samples, auto_stop, downsample_ratio, overview_buffer_size
-            sample_interval_ns = sample_interval_us * 1000
+            sample_interval_ns = picoscope_sample_interval_us * 1000
             
             self.status["runStreaming"] = ps.ps2000_run_streaming_ns(
                 self.chandle,
@@ -357,7 +596,7 @@ class PicoScopeReader:
                 raise Exception("ps2000_run_streaming_ns failed.")
 
             self.streaming = True
-            print(f"Streaming started at {1000000/sample_interval_us:.1f} Hz")
+            print(f"Streaming started at {1000000/picoscope_sample_interval_us:.1f} Hz")
             return True
 
         except Exception as e:
@@ -395,7 +634,6 @@ class PicoScopeReader:
                     mv = adc2mV(adc_values, vrange, self.maxADC)
                     voltages[ch] = [value / 1000.0 for value in mv]
                 else:
-                    print(f"Channel {ch}: No data collected")
                     voltages[ch] = np.array([])
 
             return voltages
@@ -426,8 +664,287 @@ class PicoScopeReader:
 # Global PicoScope instance
 picoscope = None
 
+DHT11_LUA_SCRIPT = """
+-- DHT11 Sensor Reader for LabJack T7
+-- Reads temperature and humidity from DHT11 sensor
+-- Results stored in USER_RAM0_F32 (humidity) and USER_RAM1_F32 (temperature)
+-- USER_RAM2_F32 stores success flag (1=success, 0=fail)
+
+local FIO_PIN = 0
+local mbRead = MB.R
+local mbWrite = MB.W
+local checkInterval = 2000
+
+-- Helper function to set pin direction (0=input, 1=output)
+local function setPinDirection(dir)
+  mbWrite(6000 + FIO_PIN, 0, dir)
+end
+
+-- Helper function to write digital state
+local function writePin(state)
+  mbWrite(2000 + FIO_PIN, 0, state)
+end
+
+-- Cache the pin read address for speed
+local pinReadAddr = 2000 + FIO_PIN
+
+-- Initialize pin as output, high
+setPinDirection(1)
+writePin(1)
+
+-- Main reading function using iteration counting
+local function readDHT11()
+  -- Send start signal
+  setPinDirection(1)  -- Output
+  writePin(0)         -- Pull LOW
+  LJ.IntervalConfig(1, 18)
+  LJ.CheckInterval(1) -- Wait 18ms
+  
+  writePin(1)         -- Release (pull high)
+  
+  -- Switch to input
+  setPinDirection(0)
+  
+  -- Small delay
+  for i=1,100 do end
+  
+  -- Wait for DHT11 response LOW pulse
+  local timeout = 0
+  while mbRead(pinReadAddr, 0) == 1 do
+    timeout = timeout + 1
+    if timeout > 10000 then
+      return false
+    end
+  end
+  
+  -- Wait for HIGH pulse
+  timeout = 0
+  while mbRead(pinReadAddr, 0) == 0 do
+    timeout = timeout + 1
+    if timeout > 10000 then
+      return false
+    end
+  end
+  
+  -- Wait for next LOW (start of data)
+  timeout = 0
+  while mbRead(pinReadAddr, 0) == 1 do
+    timeout = timeout + 1
+    if timeout > 10000 then
+      return false
+    end
+  end
+  
+  -- Read 40 bits by counting loop iterations during HIGH pulses
+  local bitCounts = {}
+  for i = 1, 40 do
+    -- Wait for HIGH
+    timeout = 0
+    while mbRead(pinReadAddr, 0) == 0 do
+      timeout = timeout + 1
+      if timeout > 10000 then
+        return false
+      end
+    end
+    
+    -- Count iterations while HIGH
+    local count = 0
+    while mbRead(pinReadAddr, 0) == 1 do
+      count = count + 1
+      if count > 10000 then
+        return false
+      end
+    end
+    
+    bitCounts[i] = count
+  end
+  
+  -- Find threshold: average of all counts, or use fixed value
+  local sumCounts = 0
+  for i = 1, 40 do
+    sumCounts = sumCounts + bitCounts[i]
+  end
+  local threshold = sumCounts / 40
+  
+  -- Convert counts to bits (longer count = 1, shorter = 0)
+  local data = {}
+  for i = 1, 40 do
+    if bitCounts[i] > threshold then
+      data[i] = 1
+    else
+      data[i] = 0
+    end
+  end
+  
+  -- Convert bits to bytes
+  local bytes = {}
+  for i = 1, 5 do
+    local byte = 0
+    for j = 1, 8 do
+      byte = byte * 2 + data[(i-1)*8 + j]
+    end
+    bytes[i] = byte
+  end
+  
+  -- Verify checksum
+  local checksum = (bytes[1] + bytes[2] + bytes[3] + bytes[4]) % 256
+  if checksum ~= bytes[5] then
+    return false
+  end
+  
+  -- Extract values
+  local humidity = bytes[1] + bytes[2] * 0.1
+  local temperature = bytes[3] + bytes[4] * 0.1
+  
+  -- Write to USER_RAM registers
+  mbWrite(46000, 3, humidity)
+  mbWrite(46002, 3, temperature)
+  mbWrite(46004, 3, 1)
+  
+  return true
+end
+
+-- Main loop
+LJ.IntervalConfig(0, checkInterval)
+
+while true do
+  if LJ.CheckInterval(0) then
+    local success = readDHT11()
+    if not success then
+      mbWrite(46004, 3, 0)
+    end
+    
+    -- Set pin back to output high
+    setPinDirection(1)
+    writePin(1)
+  end
+end
+"""
+
+class OctopusReader:
+    """
+    DHT11 temperature and humidity sensor reader using LabJack T7 Lua scripting.
+    
+    This class manages the DHT11 sensor by:
+    1. Uploading a Lua script to the T7 that handles the timing-critical protocol
+    2. Reading the results from USER_RAM registers that the Lua script updates
+    
+    The Lua script runs continuously on the T7's processor, reading the DHT11
+    every 2 seconds and storing results in USER_RAM registers.
+    """
+    
+    def __init__(self, handle, fio_channel=0):
+        """
+        Initialize DHT11 reader with LabJack connection.
+        
+        Args:
+            handle: LabJack device handle from ljm.openS()
+            fio_channel: FIO pin number for DHT11 data line (default: 0)
+        """
+        self.handle = handle
+        self.fio_pin = fio_channel
+        self.lua_loaded = False
+        
+        # Modify the Lua script to use the correct FIO pin
+        self.lua_script = DHT11_LUA_SCRIPT.replace("local FIO_PIN = 0", 
+                                                     f"local FIO_PIN = {fio_channel}")
+        
+        # Load the Lua script onto the T7
+        self._load_lua_script()
+    
+    def _load_lua_script(self):
+        """
+        Load and start the Lua script on the LabJack T7.
+        
+        The script will run continuously in the background, updating
+        USER_RAM registers with temperature and humidity readings.
+        """
+        try:
+            print(f"Loading DHT11 Lua script onto LabJack (FIO{self.fio_pin})...")
+            
+            # First, stop any running Lua script
+            ljm.eWriteName(self.handle, "LUA_RUN", 0)
+            time.sleep(0.5)
+            
+            # Clear any existing script
+            ljm.eWriteName(self.handle, "LUA_SOURCE_SIZE", 0)
+            time.sleep(0.5)
+            
+            # Write the Lua script in chunks (LJM may have size limits)
+            script_bytes = self.lua_script.encode('utf-8')
+            
+            ljm.eWriteName(self.handle, "LUA_SOURCE_SIZE", len(script_bytes)+1)
+            ljm.eWriteNameByteArray(self.handle, "LUA_SOURCE_WRITE", len(script_bytes)+1, script_bytes)
+            
+            # Check for compilation errors
+            size = ljm.eReadName(self.handle, "LUA_SOURCE_SIZE")
+            if size == 0:
+                raise Exception("Lua script failed to load (size = 0)")
+            
+            ljm.eWriteName(self.handle, "LUA_DEBUG_ENABLE", 1)
+            ljm.eWriteName(self.handle, "LUA_DEBUG_ENABLE_DEFAULT", 1)
+            ljm.eWriteName(self.handle, "LUA_RUN", 1)
+            
+            print(f"✓ DHT11 Lua script loaded and running (script size: {size} bytes)")
+            self.lua_loaded = True
+            
+            # Give the script time to perform first reading
+            time.sleep(2.5)
+            
+        except Exception as e:
+            print(f"✗ Error loading Lua script: {e}")
+            import traceback
+            traceback.print_exc()
+            self.lua_loaded = False
+    
+    def read_sensor(self):
+        """
+        Read temperature and humidity from DHT11 via USER_RAM registers.
+        
+        The Lua script continuously updates these registers every 2 seconds.
+        This method simply reads the most recent values.
+        
+        Returns:
+            tuple: (humidity, temperature, success)
+                   humidity: Relative humidity (%)
+                   temperature: Temperature (°C)
+                   success: True if reading is valid, False otherwise
+        """
+        if not self.lua_loaded:
+            print("Lua script not loaded, cannot read sensor")
+            return None, None, False
+        
+        try:
+            # Read values from USER_RAM registers
+            humidity = ljm.eReadName(self.handle, "USER_RAM0_F32")
+            temperature = ljm.eReadName(self.handle, "USER_RAM1_F32")
+            success_flag = ljm.eReadName(self.handle, "USER_RAM2_F32")
+            
+            # Check if reading was successful (Lua script sets flag to 1)
+            if success_flag == 1:
+                return humidity, temperature, True
+            else:
+                return None, None, False
+                
+        except Exception as e:
+            print(f"Error reading DHT11 data: {e}")
+            return None, None, False
+    
+    def stop(self):
+        """Stop the Lua script running on the LabJack."""
+        try:
+            if self.lua_loaded:
+                ljm.eWriteName(self.handle, "LUA_RUN", 0)
+                print("DHT11 Lua script stopped")
+                self.lua_loaded = False
+        except Exception as e:
+            print(f"Error stopping Lua script: {e}")
+
+# Global octopus instance
+octopus = None
+
 # ================================================================================================
-# HARDWARE CONFIGURATION FUNCTIONS - Set up LabJack channels for different sensor types
+# HARDWARE CONFIGURATION FUNCTIONS
 # ================================================================================================
 
 def configure_rtd(handle):
@@ -456,21 +973,15 @@ def configure_rtd(handle):
         }
         
         # Set input range & resolution
-        print(1)
         ljm.eWriteName(handle, f"AIN{pos_channel}_RANGE", 0.1)
-        print(2)
         ljm.eWriteName(handle, f"AIN{pos_channel}_RESOLUTION_INDEX", 12) # 12 = 24-bit, most precise
-        print(3)
-
         ljm.eWriteName(handle, f"AIN{neg_channel}_RANGE", 0.1)
-        print(1)
         ljm.eWriteName(handle, f"AIN{neg_channel}_RESOLUTION_INDEX", 12) # 12 = 24-bit, most precise
-        print(2)
 
         print(f"  Configured {name} RTD ({rtd_type}) on AIN{pos_channel} and AIN{neg_channel}")
 
 # ================================================================================================
-# SENSOR READING FUNCTIONS - Acquire data from hardware
+# SENSOR READING FUNCTIONS
 # ================================================================================================
 
 def read_temp_sensors():
@@ -485,9 +996,7 @@ def read_temp_sensors():
                Each is a dictionary mapping sensor names/channels to temperatures
                Returns (None, None, None, None) on error
     """
-    try:
-        handle = ljm.openS("T7", "ANY", "ANY")  # Connect to any available LabJack T7
-        
+    try:        
         # Read RTD temperatures using extended features
         rtd_temps = {}
         for name, config in ACTIVE_RTDS.items():
@@ -496,11 +1005,10 @@ def read_temp_sensors():
             # Read processed temperature from extended feature
             pos_voltage = ljm.eReadName(handle, f"AIN{pos_channel}")
             neg_voltage = ljm.eReadName(handle, f"AIN{neg_channel}")
-            resistance = (pos_voltage - neg_voltage)/0.0002 # R = V/I, I = 200 µA
-            temp = 20 + (resistance-107.794)/0.385
+            resistance = (pos_voltage - neg_voltage)/0.0002 # R = V/I, I = 200 uA
+            temp = 20 + (resistance-107.794)/0.385 + config['offset']
             rtd_temps[name] = temp
         
-        ljm.close(handle)  # Clean up connection
         return rtd_temps
         
     except Exception as e:
@@ -568,452 +1076,242 @@ def read_pressure_sensor():
         return None
     
 # ================================================================================================
-# PICOSCOPE DATA COLLECTION THREAD - High-speed continuous acquisition
+# DATA COLLECTION THREADS
 # ================================================================================================
 
 def collect_picoscope_data():
-    """
-    Dedicated high-speed thread for PicoScope data acquisition.
-    
-    Runs at ~20Hz (50ms intervals) to continuously collect and process
-    streaming data from the PicoScope independently of other sensors.
-    """
-    global start_time
-    
     print("PicoScope collection thread started")
-    
-    # Start PicoScope streaming
-    if picoscope:
-        picoscope.start_streaming(sample_interval_us=sample_interval_us)
-        print(f"PicoScope streaming started at {1000000/sample_interval_us:.0f} Hz")
+    picoscope.start_streaming(picoscope_sample_interval_us=picoscope_sample_interval_us)
     
     while not exit_event.is_set():
-        time.sleep(0.05)  # 50ms = 20Hz update rate
-        
-        if not picoscope:
-            continue
-            
-        # Get most recent streaming samples
+        time.sleep(picoscope_data_update_interval)
         stream_data = picoscope.read_voltages()
-
+        
         for ch, values in stream_data.items():
             if values is not None and len(values) > 0:
-                current_time = time.time() - start_time
+                current_time = time.time()  # Absolute timestamp
                 
-                # Initialize bin start time if needed
                 if picoscope_bin_start_time[ch] is None:
                     picoscope_bin_start_time[ch] = current_time
                 
-                # Add all new samples to bin buffer
                 picoscope_bin_buffer[ch].extend(values)
                 
                 # Process complete bins
-                while len(picoscope_bin_buffer[ch]) >= BIN_SIZE_SAMPLES:
-                    # Extract one bin worth of samples
-                    bin_samples = picoscope_bin_buffer[ch][:BIN_SIZE_SAMPLES]
-                    picoscope_bin_buffer[ch] = picoscope_bin_buffer[ch][BIN_SIZE_SAMPLES:]
+                while len(picoscope_bin_buffer[ch]) >= picoscope_bin_size:
+                    bin_samples = picoscope_bin_buffer[ch][:picoscope_bin_size]
+                    picoscope_bin_buffer[ch] = picoscope_bin_buffer[ch][picoscope_bin_size:]
                     
-                    # Calculate average for this bin
                     bin_average = float(np.mean(bin_samples))
+                    bin_timestamp = picoscope_bin_start_time[ch] + (picoscope_bin_size / 2) * picoscope_sample_period
                     
-                    # Calculate the timestamp for the middle of this bin
-                    bin_timestamp = picoscope_bin_start_time[ch] + (BIN_SIZE_SAMPLES / 2) * SAMPLE_PERIOD
+                    # FIXED: Update shared data for each channel
+                    shared_data.update_picoscope_raw(ch, bin_timestamp, bin_average)
                     
-                    # Store binned data with timestamp
-                    with data_lock:
-                        picoscope_binned_data[ch].append(bin_average)
-                        picoscope_binned_times[ch].append(bin_timestamp)
-                        
-                        # Limit to last picoscope_display_window seconds of binned data
-                        if len(picoscope_binned_data[ch]) > picoscope_display_window*20:
-                            picoscope_binned_data[ch] = picoscope_binned_data[ch][-picoscope_display_window*20:]
-                            picoscope_binned_times[ch] = picoscope_binned_times[ch][-picoscope_display_window*20:]
-                    
-                    # Update bin start time for next bin
-                    picoscope_bin_start_time[ch] += BIN_SIZE_SAMPLES * SAMPLE_PERIOD
-                
-                # Use last bin average for current value, or last sample if no complete bins yet
-                if picoscope_binned_data[ch]:
-                    voltage = picoscope_binned_data[ch][-1]
-                else:
-                    voltage = float(values[-1])
-
-                # --- Update shared data structures ---
-                shared_data.update_picoscope(ch, voltage)
-                
+                    picoscope_bin_start_time[ch] += picoscope_bin_size * picoscope_sample_period
+        
+        # Calculate and update RMS for each RMS channel
+        for ch in picoscope_rms_channels:
+            if picoscope_channels[ch]['enabled']:
                 with data_lock:
-                    picoscope_rolling_data[ch].append(voltage)
-                    if len(picoscope_rolling_data[ch]) > log_data_display_window:
-                        picoscope_rolling_data[ch].pop(0)
-
-                    # Maintain RMS window with all samples
-                    picoscope_rms_rolling_data[ch].extend(values)
-                    # Keep only last picoscope_rms_window seconds worth of data
-                    num_picoscope_samples = int(picoscope_rms_window*1000000/sample_interval_us)
-                    if len(picoscope_rms_rolling_data[ch]) > num_picoscope_samples:
-                        picoscope_rms_rolling_data[ch] = picoscope_rms_rolling_data[ch][-num_picoscope_samples:]
-
-                    # Compute RMS and share
-                    rms_value = np.sqrt(np.mean(np.square(picoscope_rms_rolling_data[ch])))
-                    shared_data.update_picoscope_rms(ch, rms_value)
-
-# ================================================================================================
-# DATA LOGGING THREAD - Background data acquisition and storage
-# ================================================================================================
-
-def log_data():
-    """
-    Background thread for continuous data acquisition and logging.
-    
-    This function runs continuously, reading sensors every second and:
-    1. Maintaining rolling averages for noise reduction
-    2. Updating shared data for other threads
-    3. Logging data to CSV file
-    4. Printing status to console
-    
-    Args:
-        supply: Power supply object for voltage/current measurements
-    """
-    global start_time
-
-    print(f"Data logging thread started with {log_data_average_interval}s averaging window")
+                    if len(shared_data.picoscope_raw_data[ch]) > 0:
+                        window_samples = int(picoscope_rms_window / picoscope_data_update_interval)
+                        recent_data = shared_data.picoscope_raw_data[ch][-window_samples:]
+                        rms_value = float(np.sqrt(np.mean(np.array(recent_data)**2)))
+                        
+                        current_time = time.time()  # Absolute timestamp
+                        shared_data.update_picoscope_rms(ch, current_time, rms_value)
+        
+def collect_temperature_data():
+    print(f"Temperature logging thread started")
     
     while not exit_event.is_set():
-        # Read all sensors
-        rtd_temps = read_temp_sensors()
+        time.sleep(temperature_sample_interval)
+        
+        current_time = time.time()  # Absolute timestamp
+        temperature = read_temp_sensors()
+        
+        if temperature:
+            # Calculate averages and std devs
+            avg_temps = {}
+            std_temps = {}
+            
+            with data_lock:
+                for rtd in ACTIVE_RTDS:
+                    temperature_data[rtd].append(temperature[rtd])
+                    temperature_time_data.append(current_time)
+                    
+                    # Calculate over averaging window
+                    window_samples = min(len(temperature_data[rtd]), 
+                                       int(temperature_average_interval / temperature_sample_interval))
+                    avg_temps[rtd] = float(np.mean(temperature_data[rtd][-window_samples:]))
+                    std_temps[rtd] = float(np.std(temperature_data[rtd][-window_samples:]))
+                
+                # FIXED: Update shared data with all values
+                shared_data.update_temperature(current_time, temperature, avg_temps, std_temps)
+            
+def collect_pressure_data():
+    print(f"Pressure logging thread started")
+    
+    while not exit_event.is_set():
+        time.sleep(pressure_sample_interval)
+        
+        current_time = time.time()  # Absolute timestamp
         pressure = read_pressure_sensor()
         
-        # Get current PicoScope values from shared data (collected by separate thread)
-        pico_voltages = {}
-        if enable_picoscope:
-            for ch in picoscope_channels:
-                if picoscope_channels[ch]['enabled']:
-                    voltage = shared_data.picoscope_voltages.get(ch)
-                    if voltage is not None:
-                        pico_voltages[ch] = voltage
-        
-        # Process temperature data if readings were successful
-        if rtd_temps is not None:
-            with data_lock:  # Thread-safe data update
-                # Update rolling averages for RTDs
-                for rtd in ACTIVE_RTDS:
-                    if rtd_temps and rtd in rtd_temps:
-                        rtd_rolling_data[rtd].append(rtd_temps[rtd])
-                        if len(rtd_rolling_data[rtd]) > log_data_average_interval:
-                            rtd_rolling_data[rtd].pop(0)
-        
-        # Store pressure for smoothing
-        if pressure is not None:
-            pressure_rolling_data.append(pressure)
-            if len(pressure_rolling_data) > log_data_display_window:
-                pressure_rolling_data.pop(0)
-        
-        # Smoothing/averaging - use mean instead of median
-        if pressure_rolling_data:
-            avg_pressure = float(np.mean(pressure_rolling_data))
-        else:
-            avg_pressure = None
-        shared_data.update_pressure(avg_pressure)
-
-        # Determine if we have enough data to process and log
-        should_process = len(time_data) == 0  # Always process first iteration
-        
-        # Check if we have any sensor data to process
-        if ACTIVE_RTDS:
-            first_rtd = next(iter(ACTIVE_RTDS))
-            should_process = should_process or len(rtd_rolling_data[first_rtd]) > 0
-            
-        # Skip processing if no active sensors
-        if not ACTIVE_RTDS:
-            should_process = False
-
-        # Process and log data
-        if should_process:
-            current_time = round(time.time() - start_time, 1)
-            timestamp_str = datetime.now().strftime('%H-%M-%S')
-
+        if pressure:
             with data_lock:
-                # Calculate means and standard deviations
-                avg_rtd = {rtd: np.mean(rtd_rolling_data[rtd]) for rtd in ACTIVE_RTDS if rtd_rolling_data[rtd]}
-                std_rtd = {rtd: np.std(rtd_rolling_data[rtd]) if len(rtd_rolling_data[rtd]) > 1 else 0.0 
-                          for rtd in ACTIVE_RTDS if rtd_rolling_data[rtd]}
+                pressure_data.append(pressure)
+                pressure_time_data.append(current_time)
                 
-                avg_picoscope = {ch: np.mean(picoscope_rolling_data[ch]) for ch in picoscope_rolling_data if picoscope_rolling_data[ch]}
+                # Calculate over averaging window
+                window_samples = min(len(pressure_data), 
+                                   int(pressure_average_interval / pressure_sample_interval))
+                avg_pressure = float(np.mean(pressure_data[-window_samples:]))
+                std_pressure = float(np.std(pressure_data[-window_samples:]))
                 
-                # Calculate RMS values for PicoScope channels
-                rms_picoscope = {}
-                for ch in picoscope_rms_rolling_data:
-                    if picoscope_rms_rolling_data[ch]:
-                        rms_picoscope[ch] = np.sqrt(np.mean(np.array(picoscope_rms_rolling_data[ch])**2))
-                
-                # Calculate pressure statistics
-                if pressure_rolling_data:
-                    avg_pressure = float(np.mean(pressure_rolling_data))
-                    std_pressure = float(np.std(pressure_rolling_data)) if len(pressure_rolling_data) > 1 else 0.0
-                else:
-                    avg_pressure = None
-                    std_pressure = None
-                
-                current_rtd = {rtd: rtd_rolling_data[rtd][-1] for rtd in ACTIVE_RTDS if rtd_rolling_data[rtd]}
-                current_picoscope = {ch: picoscope_rolling_data[ch][-1] for ch in picoscope_rolling_data if picoscope_rolling_data[ch]}
-                
-                # Update shared data for control threads
-                # Determine current temperature from available sensors
-                current_temp = None
-                if ACTIVE_RTDS and avg_rtd:
-                    current_temp = list(avg_rtd.values())[0]
-                
-                if current_temp is not None:
-                    shared_data.update_temperature(current_temp, avg_rtd)
+                # FIXED: Update shared data
+                shared_data.update_pressure(current_time, pressure, avg_pressure, std_pressure)
 
-                # Update plotting data
-                time_data.append(current_time)
-                for rtd in ACTIVE_RTDS:
-                    if rtd in avg_rtd:
-                        rtd_temp_data[rtd].append(avg_rtd[rtd])
-                        rtd_temp_std[rtd].append(std_rtd[rtd])
-                
-                # Update PicoScope plotting data
-                for ch in picoscope_data:
-                    if ch in avg_picoscope:
-                        picoscope_data[ch].append(avg_picoscope[ch])
-                
-                # Update PicoScope RMS plotting data
-                for ch in picoscope_rms_data:
-                    if ch in rms_picoscope:
-                        picoscope_rms_data[ch].append(rms_picoscope[ch])
-
-                # Limit plotting data to last log_data_display_window seconds
-                if len(time_data) > log_data_display_window*10:
-                    time_data.pop(0)
-                    for rtd in rtd_temp_data:
-                        if rtd_temp_data[rtd]:
-                            rtd_temp_data[rtd].pop(0)
-                            rtd_temp_std[rtd].pop(0)
-                    for ch in picoscope_data:
-                        if picoscope_data[ch]:
-                            picoscope_data[ch].pop(0)
-                    for ch in picoscope_rms_data:
-                        if picoscope_rms_data[ch]:
-                            picoscope_rms_data[ch].pop(0)
-
-                # Add mean pressure and std dev from rolling buffer
-                if avg_pressure is not None:
-                    pressure_data.append(avg_pressure)
-                    pressure_std.append(std_pressure)
-                else:
-                    pressure_data.append('')
-                    pressure_std.append('')
-            
-            # Write to CSV file
-            write_to_csv(timestamp_str, current_time, current_rtd,
-                        avg_rtd, std_rtd, avg_pressure, std_pressure,
-                        current_picoscope, avg_picoscope, rms_picoscope)
-
-def write_to_csv(timestamp_str, current_time, current_rtd, 
-                 avg_rtd, std_rtd, avg_pressure, std_pressure,
-                 current_picoscope, avg_picoscope, rms_picoscope):
-    """
-    Write sensor data to CSV file.
-    
-    Chooses between raw data or averaged data based on configuration.
-    Includes electrical measurements if enabled.
-    """
-    try:
-        with open(csv_filename, mode="a", newline="") as file:
-            writer = csv.writer(file)
-            
-            # Prepare data row
-            row = [timestamp_str, current_time]
-            
-            # Add RTD mean and std dev
-            for rtd in ACTIVE_RTDS:
-                if log_data_record_raw_data:
-                    row.extend([current_rtd.get(rtd, ''), ''])  # Raw data has no std dev
-                else:
-                    row.extend([avg_rtd.get(rtd, ''), std_rtd.get(rtd, '')])
-            
-            # Add pressure mean and std dev
-            if log_data_record_raw_data:
-                if pressure_rolling_data:
-                    row.extend([pressure_rolling_data[-1], ''])  # Raw data has no std dev
-                else:
-                    row.extend(['', ''])
-            else:
-                row.extend([avg_pressure if avg_pressure is not None else '', 
-                           std_pressure if std_pressure is not None else ''])
-            
-            # Add PicoScope raw data (raw or averaged)
-            if enable_picoscope:
-                for ch in picoscope_channels:
-                    if picoscope_channels[ch]['enabled']:
-                        if log_data_record_raw_data:
-                            row.append(current_picoscope.get(ch, ''))
-                        else:
-                            row.append(avg_picoscope.get(ch, ''))
-            
-            # Add PicoScope RMS data
-            if enable_picoscope:
-                for ch in picoscope_channels:
-                    if picoscope_channels[ch]['enabled']:
-                        row.append(rms_picoscope.get(ch, ''))
-            
-            writer.writerow(row)
-            
-    except Exception as e:
-        print(f"CSV write error: {e}")
+def collect_octopus_data():
+    while not exit_event.is_set():
+        octopus_humidity, octopus_temperature, octopus_success = octopus.read_sensor()
+        print(f"Octopus data read: {octopus_success}. Humidity {octopus_humidity}, temperature {octopus_temperature}")
+        
+        time.sleep(2)  # DHT11 requires at least 2 second interval between readings
 
 # ================================================================================================
-# PLOTTING FUNCTIONS - Real-time data visualization with dual windows
+# PLOTTING FUNCTIONS
 # ================================================================================================
 
 def update_temperature_plot(frame):
-    """
-    Update temperature plot with all temperature sensors and error bars.
-    
-    Args:
-        frame: Animation frame number (unused but required by matplotlib)
-    """
     with data_lock:
         ax_temp.clear()
+        times, temps, averages, stds = shared_data.get_temperature_rolling_data()
         
-        # Plot RTD data with error bars (standard deviation)
         for rtd in ACTIVE_RTDS:
-            if rtd_temp_data[rtd] and rtd_temp_std[rtd]:
-                # Convert to numpy arrays for plotting
-                times = np.array(time_data)
-                temps = np.array(rtd_temp_data[rtd])
-                stds = np.array(rtd_temp_std[rtd])
-                
-                # Plot line
-                ax_temp.plot(times, temps, label=f"{rtd}", 
-                           linestyle='-', linewidth=2)
-                
-                # Add shaded error region (±1 standard deviation)
-                ax_temp.fill_between(times, temps - stds, temps + stds, 
-                                    alpha=0.2)
-
+            # Convert to relative time for plotting
+            times_arr = np.array(times) - start_time
+            
+            if temperature_display_raw_data:
+                temps_arr = np.array(temps[rtd])
+                stds_arr = np.array(stds[rtd])
+                ax_temp.plot(times_arr, temps_arr, label=f"{rtd}", linewidth=2)
+                ax_temp.fill_between(times_arr, temps_arr - stds_arr, temps_arr + stds_arr, alpha=0.2)
+            else:
+                avgs_arr = np.array(averages[rtd])
+                stds_arr = np.array(stds[rtd])
+                ax_temp.plot(times_arr, avgs_arr, label=f"{rtd}", linewidth=2)
+                ax_temp.fill_between(times_arr, avgs_arr - stds_arr, avgs_arr + stds_arr, alpha=0.2)
+        
         ax_temp.legend(loc='upper left')
-
-    # Format plot appearance
-    ax_temp.set_xlabel("Time (s)")
-    ax_temp.set_ylabel("Temperature (°C)")
-    ax_temp.set_title("Temperature Measurements (15s mean, ±1 StdDev)")
-    ax_temp.grid(True, alpha=0.3)
-    
-    if time_data:
-        ax_temp.set_xlim(max(0, time_data[-1] - log_data_display_window), time_data[-1] + 1)
-
+        ax_temp.set_xlabel("Time (s)")
+        ax_temp.set_ylabel("Temperature (°C)")
+        ax_temp.set_title(f"Temperature ({temperature_average_interval}s avg, ±1σ)")
+        ax_temp.grid(True, alpha=0.3)
 
 def update_pressure_plot(frame):
-    """
-    Update pressure plot with error bars.
-    
-    Args:
-        frame: Animation frame number (unused but required by matplotlib)
-    """
     with data_lock:
         ax_pressure.clear()
+        times, pressures, averages, stds = shared_data.get_pressure_rolling_data()
         
-        # Plot pressure data with error bars (standard deviation)
-        if pressure_data and any(type(p)==float for p in pressure_data):
-            # Filter out empty strings and convert to numpy arrays
-            valid_indices = [i for i, p in enumerate(pressure_data) if type(p)==float]
-            if valid_indices:
-                times = np.array([time_data[i] for i in valid_indices])
-                pressures = np.array([pressure_data[i] for i in valid_indices])
-                stds = np.array([pressure_std[i] if type(pressure_std[i])==float else 0.0 
-                               for i in valid_indices])
-                
-                # Plot line
-                ax_pressure.plot(times, pressures, color="tab:green", 
-                               linestyle='-', linewidth=2, label="Pressure")
-                
-                # Add shaded error region (±1 standard deviation)
-                ax_pressure.fill_between(times, pressures - stds, pressures + stds, 
-                                        color="tab:green", alpha=0.2)
-                
-                ax_pressure.legend(loc='upper left')
-
-    # Format plot appearance
-    ax_pressure.set_xlabel("Time (s)")
-    ax_pressure.set_ylabel("Pressure (Bar)")
-    ax_pressure.set_title("Pressure Measurements (15s mean, ±1 StdDev)")
-    ax_pressure.grid(True, alpha=0.3)
-    
-    if time_data:
-        ax_pressure.set_xlim(max(0, time_data[-1] - log_data_display_window), time_data[-1] + 1)
-
+        # Convert to relative time for plotting
+        times_arr = np.array(times) - start_time
+        
+        if pressure_display_raw_data:
+            press_arr = np.array(pressures)
+            stds_arr = np.array(stds)
+            ax_pressure.plot(times_arr, press_arr, linewidth=2)
+            ax_pressure.fill_between(times_arr, press_arr - stds_arr, press_arr + stds_arr, alpha=0.2)
+        else:
+            avgs_arr = np.array(averages)
+            stds_arr = np.array(stds)
+            ax_pressure.plot(times_arr, avgs_arr, linewidth=2)
+            ax_pressure.fill_between(times_arr, avgs_arr - stds_arr, avgs_arr + stds_arr, alpha=0.2)
+        
+        ax_pressure.set_xlabel("Time (s)")
+        ax_pressure.set_ylabel("Pressure (Bar)")
+        ax_pressure.set_title(f"Pressure ({pressure_average_interval}s avg, ±1σ)")
+        ax_pressure.grid(True, alpha=0.3)
 
 def update_picoscope_raw_plot(frame):
-    """
-    Update PicoScope raw data plot with 20Hz binned averages.
-    
-    Args:
-        frame: Animation frame number (unused but required by matplotlib)
-    """
     with data_lock:
         ax_pico_raw.clear()
+        times, voltages, peak_times = shared_data.get_picoscope_raw_rolling_data()
         
-        # Plot binned PicoScope data (20 points/second)
-        if enable_picoscope:
-            color_map = {'A': 'tab:orange', 'B': 'tab:purple'}
-            for ch in picoscope_binned_data:
-                if picoscope_binned_data[ch] and picoscope_binned_times[ch]:
-                    ax_pico_raw.plot(picoscope_binned_times[ch], picoscope_binned_data[ch], 
-                                   color=color_map.get(ch, 'tab:orange'),
-                                   linestyle='-', linewidth=1, 
-                                   label=f"Photodiode Ch{ch}")
-            
-            ax_pico_raw.legend(loc='upper left')
-            
-            # Set x-axis limits based on latest data
-            all_times = []
-            for ch in picoscope_binned_times:
-                if picoscope_binned_times[ch]:
-                    all_times.extend(picoscope_binned_times[ch])
-            
-            if all_times:
-                latest_time = max(all_times)
-                ax_pico_raw.set_xlim(max(0, latest_time - picoscope_display_window), latest_time + 1)
+        for ch in picoscope_raw_channels:
+            if picoscope_channels[ch]['enabled'] and ch in times:
+                # Convert to relative time for plotting
+                times_arr = np.array(times[ch]) - start_time
+                volts_arr = np.array(voltages[ch])
+                ax_pico_raw.plot(times_arr, volts_arr, label=f"Ch{ch}", linewidth=2)
 
-    # Format plot appearance
-    ax_pico_raw.set_xlabel("Time (s)")
-    ax_pico_raw.set_ylabel("Voltage (V)")
-    ax_pico_raw.set_title("PicoScope Raw Data (0.05s bins)")
-    ax_pico_raw.grid(True, alpha=0.3)
+                # Plot peaks if available
+                peak_times_arr = np.array(peak_times[ch]) - start_time
+                peak_volts_arr = volts_arr[[np.searchsorted(times_arr, pt) for pt in peak_times_arr]]
+                ax_pico_raw.scatter(peak_times_arr, peak_volts_arr, color='red', label=f"Ch{ch} Peaks", zorder=5)
 
+        ax_pico_raw.legend(loc='upper left')
+        ax_pico_raw.set_xlabel("Time (s)")
+        ax_pico_raw.set_ylabel("Voltage (V)")
+        ax_pico_raw.set_title("Picoscope Raw Data")
+        ax_pico_raw.grid(True, alpha=0.3)
 
 def update_picoscope_rms_plot(frame):
-    """
-    Update PicoScope RMS data plot.
-    
-    Args:
-        frame: Animation frame number (unused but required by matplotlib)
-    """
     with data_lock:
         ax_pico_rms.clear()
+        times, voltages = shared_data.get_picoscope_rms_rolling_data()
         
-        # Plot RMS PicoScope data
-        if enable_picoscope:
-            color_map_rms = {'A': 'tab:red', 'B': 'tab:pink'}
-            for ch in picoscope_rms_data:
-                if picoscope_rms_data[ch]:
-                    ax_pico_rms.plot(time_data, picoscope_rms_data[ch], 
-                                   color=color_map_rms.get(ch, 'tab:red'),
-                                   linestyle='-', linewidth=2, 
-                                   label=f"Photodiode Ch{ch} RMS")
-            
-            ax_pico_rms.legend(loc='upper left')
+        for ch in picoscope_rms_channels:
+            if picoscope_channels[ch]['enabled'] and ch in times:
+                # Convert to relative time for plotting
+                times_arr = np.array(times[ch]) - start_time
+                volts_arr = np.array(voltages[ch])
+                ax_pico_rms.plot(times_arr, volts_arr, label=f"Ch{ch} RMS", linewidth=2)
+        
+        ax_pico_rms.legend(loc='upper left')
+        ax_pico_rms.set_xlabel("Time (s)")
+        ax_pico_rms.set_ylabel("RMS Voltage (V)")
+        ax_pico_rms.set_title(f"Picoscope RMS Data ({picoscope_rms_window}s window)")
+        ax_pico_rms.grid(True, alpha=0.3)
 
-    # Format plot appearance
-    ax_pico_rms.set_xlabel("Time (s)")
-    ax_pico_rms.set_ylabel("RMS Voltage (V)")
-    ax_pico_rms.set_title("PicoScope RMS Data (30s window)")
-    ax_pico_rms.grid(True, alpha=0.3)
+def update_text_display(frame):
+    # Get current values from your data (adjust these to match your actual data sources)
+    current_temp = round(shared_data.get_temperature_rolling_data()[0][-1], 2)
+    current_pressure = round(shared_data.get_pressure_rolling_data()[0][-1], 2)
+    current_pico_raw = round(shared_data.get_picoscope_raw_rolling_data()[0][-1], 4)
+    current_pico_rms = round(shared_data.get_picoscope_rms_rolling_data()[0][-1], 4)
+    peaks = shared_data.get_picoscope_raw_rolling_data()[2]
     
-    if time_data:
-        ax_pico_rms.set_xlim(max(0, time_data[-1] - log_data_display_window), time_data[-1] + 1)
+    # Get temperature and humidity from other stream
+    current_humidity, current_temperature = shared_data.get_octopus_data()
+    current_temperature = round(current_temperature, 2)
+    current_humidity = round(current_humidity, 1)
+
+    # Format the text display
+    text_content = f"""
+    Temperature: {current_temp:.2f}°C
+
+    Pressure: {current_pressure:.2f} bar
+
+    Picoscope Raw: {current_pico_raw:.4f} V
+
+    Picoscope RMS: {current_pico_rms:.4f} V
+
+    Recent Fringe Peaks: {', '.join(f'{p:.2f}s' for p in peaks.get('A', [])[-5:])}
+
+    {'='*25}
+
+    Ambient Temp: {current_temperature:.2f}°C
+
+    Humidity: {current_humidity:.1f}%
+    """
+    
+    text_display.set_text(text_content)
+    return text_display
+
+# ================================================================================================
+# MAIN FUNCTION
+# ================================================================================================
 
 if __name__ == "__main__":
     """
@@ -1041,48 +1339,74 @@ if __name__ == "__main__":
                 print("WARNING: PicoScope initialization failed, continuing without it")
                 enable_picoscope = False
                 picoscope = None
-        
+
         # Initialize LabJack connection and configure sensors
         print("Initializing LabJack connection...")
         handle = ljm.openS("T7", "ANY", "ANY")
-        print(f"Connected to LabJack T7")
+
+        if enable_octopus:
+            print("Initializing octopus...")
+            octopus = OctopusReader(handle)
         
         # Configure all sensor types
         configure_rtd(handle)
-        ljm.close(handle)  # Close configuration connection
 
         print(f"\nStarting system... Data logging to: {csv_filename}")
         print("Close the plot window or press Ctrl+C to stop.\n")
 
         # ================================================================================================
-        # THREAD STARTUP - Launch background processes
+        # THREAD STARTUP
         # ================================================================================================
-        pico_thread = threading.Thread(target=collect_picoscope_data, daemon=True)
-        pico_thread.start()
-        print("✓ Picoscope data logging thread started")
+        if enable_picoscope:
+            pico_thread = threading.Thread(target=collect_picoscope_data, daemon=True)
+            pico_thread.start()
         
-        log_thread = threading.Thread(target=log_data, daemon=True)
-        log_thread.start()
-        print("✓ Main data logging thread started")
+        if enable_temperature:
+            temp_thread = threading.Thread(target=collect_temperature_data, daemon=True)
+            temp_thread.start()
 
-        print("\nAll threads started successfully!")
+        if enable_pressure:
+            pressure_thread = threading.Thread(target=collect_pressure_data, daemon=True)
+            pressure_thread.start()
+
+        if enable_octopus:
+            octopus_thread = threading.Thread(target=collect_octopus_data, daemon=True)
+            octopus_thread.start()
+
+        csv_writer_thread = threading.Thread(target=csv_writer_thread, daemon=True)
+        csv_writer_thread.start()
+
+        print("All threads started successfully!")
         print("-" * 80)
 
         # ================================================================================================
-        # MAIN LOOP - Real-time plotting interface with four separate plots
+        # MAIN LOOP
         # ================================================================================================
         
-        # Initialize matplotlib for real-time plotting with four subplots
-        print("Starting real-time plot display...")
-        fig, ((ax_temp, ax_pressure), (ax_pico_raw, ax_pico_rms)) = plt.subplots(2, 2, figsize=(16, 10))
+        # Initialize matplotlib for real-time plotting with gridspec for a custom layout
+        print("Starting display...")
+        fig = plt.figure(figsize=(20, 10))
+        gs = fig.add_gridspec(2, 3, width_ratios=[1, 1, 0.4], hspace=0.15, wspace=0.15)
+
+        # Create the 2x2 plot grid on the left
+        ax_temp = fig.add_subplot(gs[0, 0])
+        ax_pressure = fig.add_subplot(gs[0, 1])
+        ax_pico_raw = fig.add_subplot(gs[1, 0])
+        ax_pico_rms = fig.add_subplot(gs[1, 1])
+
         fig.suptitle('Sensor Monitoring Dashboard', fontsize=16, fontweight='bold')
-        plt.subplots_adjust(hspace=0.3, wspace=0.3)
+
+        # Create text display area on the right (spans both rows)
+        ax_text = fig.add_subplot(gs[:, 2])
+        ax_text.axis('off')  # Hide axes for text area
+        text_display = ax_text.text(0.1, 0.5, '', fontsize=12, verticalalignment='center', family='monospace', transform=ax_text.transAxes)
         
         # Create animations for all four plots
-        ani_temp = animation.FuncAnimation(fig, update_temperature_plot, interval=50, cache_frame_data=False)
-        ani_pressure = animation.FuncAnimation(fig, update_pressure_plot, interval=50, cache_frame_data=False)
-        ani_pico_raw = animation.FuncAnimation(fig, update_picoscope_raw_plot, interval=50, cache_frame_data=False)
-        ani_pico_rms = animation.FuncAnimation(fig, update_picoscope_rms_plot, interval=50, cache_frame_data=False)
+        ani_temp = animation.FuncAnimation(fig, update_temperature_plot, interval=100, cache_frame_data=False)
+        ani_pressure = animation.FuncAnimation(fig, update_pressure_plot, interval=100, cache_frame_data=False)
+        ani_pico_raw = animation.FuncAnimation(fig, update_picoscope_raw_plot, interval=100, cache_frame_data=False)
+        ani_pico_rms = animation.FuncAnimation(fig, update_picoscope_rms_plot, interval=100, cache_frame_data=False)
+        ani_text = animation.FuncAnimation(fig, update_text_display, interval=100, cache_frame_data=False)
         
         # Start matplotlib GUI (blocks until window is closed)
         plt.show()
@@ -1097,7 +1421,7 @@ if __name__ == "__main__":
         
         # Signal all threads to stop
         exit_event.set()  
-        time.sleep(2)  # Give threads time to clean up
+        time.sleep(1)  # Give threads time to clean up
         
         # Close PicoScope connection
         if enable_picoscope and picoscope:
