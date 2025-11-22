@@ -129,16 +129,16 @@ octopus_fio_channel = 0  # FIO channel for octopus sensor wire
 
 # ---------------- TEMPERATURE ----------------
 temperature_sample_interval = 0.2       # Interval (seconds) between samples
-temperature_average_interval = 5      # Window (seconds) for which samples are averaged
+temperature_average_interval = 1      # Window (seconds) for which samples are averaged
 temperature_display_window = 60       # Window (seconds) for which data is displayed
 temperature_display_raw_data = False  # Display raw readings on graph (false = displays averaged data)
 temperature_record_raw_data = True    # Record raw readings in CSV (false = records averaged data)
 
 # ---------------- PRESSURE ----------------
 pressure_sample_interval = 0.2        # Interval (seconds) between samples
-pressure_average_interval = 30        # Window (seconds) for which samples are averaged
+pressure_average_interval = 5        # Window (seconds) for which samples are averaged
 pressure_display_window = 60          # Window (seconds) for which data is displayed
-pressure_display_raw_data = False     # Display raw readings on graph (false = displays averaged data)
+pressure_display_raw_data = True     # Display raw readings on graph (false = displays averaged data)
 pressure_record_raw_data = True       # Record raw readings in CSV (false = records averaged data)
 
 # ---------------- PICOSCOPE ----------------
@@ -280,6 +280,10 @@ class SharedData:
 
     def update_pressure(self, new_time_data, new_pressure_data, new_average_data, new_std_data):
         with self.lock:
+            if self.pressure_data:
+                if new_pressure_data < 0.5*self.pressure_data[-1] or new_pressure_data > 2*self.pressure_data[-1]:
+                    return # Ignore pressure spike
+
             self.pressure_time_data.append(new_time_data)
             self.pressure_data.append(new_pressure_data)
             self.pressure_average_data.append(new_average_data)
@@ -665,159 +669,99 @@ class PicoScopeReader:
 picoscope = None
 
 DHT11_LUA_SCRIPT = """
--- DHT11 Sensor Reader for LabJack T7
--- Reads temperature and humidity from DHT11 sensor
--- Results stored in USER_RAM0_F32 (humidity) and USER_RAM1_F32 (temperature)
--- USER_RAM2_F32 stores success flag (1=success, 0=fail)
+-- DHT11 Reader Lua Script
+-- Input: USER_RAM0_U32 = DIO pin number
+-- Output: USER_RAM1_U32 = error code (0=success, 253=timeout, 254=checksum)
+--         USER_RAM2_U32 = humidity
+--         USER_RAM3_U32 = temperature
 
-local FIO_PIN = 0
-local mbRead = MB.R
-local mbWrite = MB.W
-local checkInterval = 2000
+local pin = MB.R(46000, 1)  -- Read pin from USER_RAM0_U32
+local data = {}
 
--- Helper function to set pin direction (0=input, 1=output)
-local function setPinDirection(dir)
-  mbWrite(6000 + FIO_PIN, 0, dir)
+-- Send start signal
+MB.W(2000 + pin, 1, 0)  -- Set pin as output (DIO_DIRECTION)
+MB.W(2000 + pin, 0, 0)  -- Pull LOW
+LJ.IntervalConfig(0, 20000)  -- 20ms delay
+while LJ.CheckInterval(0) == 0 do end
+
+MB.W(2000 + pin, 0, 1)  -- Pull HIGH
+LJ.IntervalConfig(0, 40)  -- 40us delay
+while LJ.CheckInterval(0) == 0 do end
+
+MB.W(2000 + pin, 1, 1)  -- Set as input
+
+-- Wait for sensor response (LOW)
+local timeout = LJ.Tick()
+while MB.R(2000 + pin, 0) == 1 do
+  if LJ.Tick() - timeout > 100000 then
+    MB.W(46002, 3, 243)  -- Write timeout error
+    MB.W(46004, 3, 0)
+    MB.W(46006, 3, 0)
+    return
+  end
 end
 
--- Helper function to write digital state
-local function writePin(state)
-  mbWrite(2000 + FIO_PIN, 0, state)
+-- Wait for HIGH
+LJ.IntervalConfig(0, 80)
+while LJ.CheckInterval(0) == 0 do end
+
+if MB.R(2000 + pin, 0) == 0 then
+  MB.W(46002, 3, 233)
+  MB.W(46004, 3, 0)
+  MB.W(46006, 3, 0)
+  return
 end
 
--- Cache the pin read address for speed
-local pinReadAddr = 2000 + FIO_PIN
+LJ.IntervalConfig(0, 80)
+while LJ.CheckInterval(0) == 0 do end
 
--- Initialize pin as output, high
-setPinDirection(1)
-writePin(1)
-
--- Main reading function using iteration counting
-local function readDHT11()
-  -- Send start signal
-  setPinDirection(1)  -- Output
-  writePin(0)         -- Pull LOW
-  LJ.IntervalConfig(1, 18)
-  LJ.CheckInterval(1) -- Wait 18ms
-  
-  writePin(1)         -- Release (pull high)
-  
-  -- Switch to input
-  setPinDirection(0)
-  
-  -- Small delay
-  for i=1,100 do end
-  
-  -- Wait for DHT11 response LOW pulse
-  local timeout = 0
-  while mbRead(pinReadAddr, 0) == 1 do
-    timeout = timeout + 1
-    if timeout > 10000 then
-      return false
-    end
-  end
-  
-  -- Wait for HIGH pulse
-  timeout = 0
-  while mbRead(pinReadAddr, 0) == 0 do
-    timeout = timeout + 1
-    if timeout > 10000 then
-      return false
-    end
-  end
-  
-  -- Wait for next LOW (start of data)
-  timeout = 0
-  while mbRead(pinReadAddr, 0) == 1 do
-    timeout = timeout + 1
-    if timeout > 10000 then
-      return false
-    end
-  end
-  
-  -- Read 40 bits by counting loop iterations during HIGH pulses
-  local bitCounts = {}
-  for i = 1, 40 do
-    -- Wait for HIGH
-    timeout = 0
-    while mbRead(pinReadAddr, 0) == 0 do
-      timeout = timeout + 1
-      if timeout > 10000 then
-        return false
+-- Read 5 bytes of data
+for i = 1, 5 do
+  local byte = 0
+  for bit = 7, 0, -1 do
+    -- Wait for LOW to HIGH transition
+    timeout = LJ.Tick()
+    while MB.R(2000 + pin, 0) == 0 do
+      if LJ.Tick() - timeout > 100000 then
+        MB.W(46002, 3, 223)
+        MB.W(46004, 3, 0)
+        MB.W(46006, 3, 0)
+        return
       end
     end
     
-    -- Count iterations while HIGH
-    local count = 0
-    while mbRead(pinReadAddr, 0) == 1 do
-      count = count + 1
-      if count > 10000 then
-        return false
+    -- Wait 30us then check if still HIGH
+    LJ.IntervalConfig(0, 30)
+    while LJ.CheckInterval(0) == 0 do end
+    
+    if MB.R(2000 + pin, 0) == 1 then
+      byte = byte + (2^bit)
+    end
+    
+    -- Wait for HIGH to LOW transition
+    timeout = LJ.Tick()
+    while MB.R(2000 + pin, 0) == 1 do
+      if LJ.Tick() - timeout > 100000 then
+        MB.W(46002, 3, 213)
+        MB.W(46004, 3, 0)
+        MB.W(46006, 3, 0)
+        return
       end
     end
-    
-    bitCounts[i] = count
   end
-  
-  -- Find threshold: average of all counts, or use fixed value
-  local sumCounts = 0
-  for i = 1, 40 do
-    sumCounts = sumCounts + bitCounts[i]
-  end
-  local threshold = sumCounts / 40
-  
-  -- Convert counts to bits (longer count = 1, shorter = 0)
-  local data = {}
-  for i = 1, 40 do
-    if bitCounts[i] > threshold then
-      data[i] = 1
-    else
-      data[i] = 0
-    end
-  end
-  
-  -- Convert bits to bytes
-  local bytes = {}
-  for i = 1, 5 do
-    local byte = 0
-    for j = 1, 8 do
-      byte = byte * 2 + data[(i-1)*8 + j]
-    end
-    bytes[i] = byte
-  end
-  
-  -- Verify checksum
-  local checksum = (bytes[1] + bytes[2] + bytes[3] + bytes[4]) % 256
-  if checksum ~= bytes[5] then
-    return false
-  end
-  
-  -- Extract values
-  local humidity = bytes[1] + bytes[2] * 0.1
-  local temperature = bytes[3] + bytes[4] * 0.1
-  
-  -- Write to USER_RAM registers
-  mbWrite(46000, 3, humidity)
-  mbWrite(46002, 3, temperature)
-  mbWrite(46004, 3, 1)
-  
-  return true
+  data[i] = byte
 end
 
--- Main loop
-LJ.IntervalConfig(0, checkInterval)
-
-while true do
-  if LJ.CheckInterval(0) then
-    local success = readDHT11()
-    if not success then
-      mbWrite(46004, 3, 0)
-    end
-    
-    -- Set pin back to output high
-    setPinDirection(1)
-    writePin(1)
-  end
+-- Verify checksum
+local checksum = (data[1] + data[2] + data[3] + data[4]) % 256
+if data[5] == checksum then
+  MB.W(46002, 3, 0)  -- Success
+  MB.W(46004, 3, data[1])  -- Humidity
+  MB.W(46006, 3, data[3])  -- Temperature
+else
+  MB.W(46002, 3, 254)  -- Checksum error
+  MB.W(46004, 3, 0)
+  MB.W(46006, 3, 0)
 end
 """
 
@@ -832,6 +776,9 @@ class OctopusReader:
     The Lua script runs continuously on the T7's processor, reading the DHT11
     every 2 seconds and storing results in USER_RAM registers.
     """
+
+    ERROR_TIMEOUT = 253
+    ERROR_CHECKSUM = 254
     
     def __init__(self, handle, fio_channel=0):
         """
@@ -869,6 +816,9 @@ class OctopusReader:
             # Clear any existing script
             ljm.eWriteName(self.handle, "LUA_SOURCE_SIZE", 0)
             time.sleep(0.5)
+
+            # Write the FIO pin number to USER_RAM0_U32 as an input to the script
+            ljm.eWriteName(self.handle, "USER_RAM0_U32", self.fio_pin)
             
             # Write the Lua script in chunks (LJM may have size limits)
             script_bytes = self.lua_script.encode('utf-8')
@@ -887,9 +837,6 @@ class OctopusReader:
             
             print(f"✓ DHT11 Lua script loaded and running (script size: {size} bytes)")
             self.lua_loaded = True
-            
-            # Give the script time to perform first reading
-            time.sleep(2.5)
             
         except Exception as e:
             print(f"✗ Error loading Lua script: {e}")
@@ -910,25 +857,22 @@ class OctopusReader:
                    temperature: Temperature (°C)
                    success: True if reading is valid, False otherwise
         """
+
         if not self.lua_loaded:
             print("Lua script not loaded, cannot read sensor")
             return None, None, False
         
         try:
-            # Read values from USER_RAM registers
-            humidity = ljm.eReadName(self.handle, "USER_RAM0_F32")
-            temperature = ljm.eReadName(self.handle, "USER_RAM1_F32")
-            success_flag = ljm.eReadName(self.handle, "USER_RAM2_F32")
-            
-            # Check if reading was successful (Lua script sets flag to 1)
-            if success_flag == 1:
-                return humidity, temperature, True
-            else:
-                return None, None, False
-                
+            # Read results from USER_RAM
+            error = int(ljm.eReadName(self.handle, "USER_RAM1_F32"))
+            humidity = int(ljm.eReadName(self.handle, "USER_RAM2_F32"))
+            temperature = int(ljm.eReadName(self.handle, "USER_RAM3_F32"))
+            if error != 0:
+                return (error, None, None)
+            return (0, temperature, humidity)
         except Exception as e:
             print(f"Error reading DHT11 data: {e}")
-            return None, None, False
+            return False, None, None
     
     def stop(self):
         """Stop the Lua script running on the LabJack."""
@@ -1058,7 +1002,7 @@ def read_pressure_sensor():
                           parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_ONE) as ser:
             send_fluke_command(ser, "*CLS")  
             send_fluke_command(ser, "*IDN?")  
-            time.sleep(0.1)
+            time.sleep(0.01)
 
             # Query Pressure
             send_fluke_command(ser, "VAL?")
@@ -1146,14 +1090,13 @@ def collect_temperature_data():
                     avg_temps[rtd] = float(np.mean(temperature_data[rtd][-window_samples:]))
                     std_temps[rtd] = float(np.std(temperature_data[rtd][-window_samples:]))
                 
-                # FIXED: Update shared data with all values
                 shared_data.update_temperature(current_time, temperature, avg_temps, std_temps)
             
 def collect_pressure_data():
     print(f"Pressure logging thread started")
     
     while not exit_event.is_set():
-        time.sleep(pressure_sample_interval)
+        time.sleep(max(0,pressure_sample_interval-1))
         
         current_time = time.time()  # Absolute timestamp
         pressure = read_pressure_sensor()
@@ -1169,12 +1112,11 @@ def collect_pressure_data():
                 avg_pressure = float(np.mean(pressure_data[-window_samples:]))
                 std_pressure = float(np.std(pressure_data[-window_samples:]))
                 
-                # FIXED: Update shared data
                 shared_data.update_pressure(current_time, pressure, avg_pressure, std_pressure)
 
 def collect_octopus_data():
     while not exit_event.is_set():
-        octopus_humidity, octopus_temperature, octopus_success = octopus.read_sensor()
+        octopus_success, octopus_humidity, octopus_temperature = octopus.read_sensor()
         print(f"Octopus data read: {octopus_success}. Humidity {octopus_humidity}, temperature {octopus_temperature}")
         
         time.sleep(2)  # DHT11 requires at least 2 second interval between readings
@@ -1276,10 +1218,25 @@ def update_picoscope_rms_plot(frame):
 
 def update_text_display(frame):
     # Get current values from your data (adjust these to match your actual data sources)
-    current_temp = round(shared_data.get_temperature_rolling_data()[0][-1], 2)
-    current_pressure = round(shared_data.get_pressure_rolling_data()[0][-1], 2)
-    current_pico_raw = round(shared_data.get_picoscope_raw_rolling_data()[0][-1], 4)
-    current_pico_rms = round(shared_data.get_picoscope_rms_rolling_data()[0][-1], 4)
+    try:
+        current_temps = []
+        temp_rolling_data = shared_data.get_temperature_rolling_data()
+        for rtd in ACTIVE_RTDS:
+            current_temps.append(temp_rolling_data[1][rtd][-1])
+    except:
+        current_temps = []
+    try:
+        current_pressure = round(shared_data.get_pressure_rolling_data()[1][-1], 3)
+    except:
+        current_pressure = 0
+    try:
+        current_pico_raw = round(shared_data.get_picoscope_raw_rolling_data()[1][-1], 4)
+    except:
+        current_pico_raw = 0
+    try:
+        current_pico_rms = round(shared_data.get_picoscope_rms_rolling_data()[1][-1], 4)
+    except:
+        current_pico_rms = 0
     peaks = shared_data.get_picoscope_raw_rolling_data()[2]
     
     # Get temperature and humidity from other stream
@@ -1289,25 +1246,31 @@ def update_text_display(frame):
 
     # Format the text display
     text_content = f"""
-    Temperature: {current_temp:.2f}°C
+    RTD temperatures: 
+    {', '.join(f'{temp:.2f}°C' for temp in current_temps)}
 
-    Pressure: {current_pressure:.2f} bar
+    Pressure: 
+    {current_pressure:.2f} bar
 
-    Picoscope Raw: {current_pico_raw:.4f} V
+    Picoscope Raw: 
+    {current_pico_raw:.4f} V
 
-    Picoscope RMS: {current_pico_rms:.4f} V
+    Picoscope RMS: 
+    {current_pico_rms:.4f} V
 
-    Recent Fringe Peaks: {', '.join(f'{p:.2f}s' for p in peaks.get('A', [])[-5:])}
+    Recent Fringe Peaks: 
+    {', '.join(f'{p:.2f}s' for p in peaks.get('A', [])[-5:])}
 
-    {'='*25}
+    {'='*10}
 
-    Ambient Temp: {current_temperature:.2f}°C
+    Ambient Temp: 
+    {current_temperature:.2f}°C
 
-    Humidity: {current_humidity:.1f}%
+    Humidity: 
+    {current_humidity:.1f}%
     """
     
     text_display.set_text(text_content)
-    return text_display
 
 # ================================================================================================
 # MAIN FUNCTION
@@ -1386,7 +1349,7 @@ if __name__ == "__main__":
         # Initialize matplotlib for real-time plotting with gridspec for a custom layout
         print("Starting display...")
         fig = plt.figure(figsize=(20, 10))
-        gs = fig.add_gridspec(2, 3, width_ratios=[1, 1, 0.4], hspace=0.15, wspace=0.15)
+        gs = fig.add_gridspec(2, 3, width_ratios=[1, 1, 0.3], hspace=0.25, wspace=0.3)
 
         # Create the 2x2 plot grid on the left
         ax_temp = fig.add_subplot(gs[0, 0])
@@ -1399,7 +1362,7 @@ if __name__ == "__main__":
         # Create text display area on the right (spans both rows)
         ax_text = fig.add_subplot(gs[:, 2])
         ax_text.axis('off')  # Hide axes for text area
-        text_display = ax_text.text(0.1, 0.5, '', fontsize=12, verticalalignment='center', family='monospace', transform=ax_text.transAxes)
+        text_display = ax_text.text(-0.5, 0.5, 'test', fontsize=12, verticalalignment='center', family='sans-serif', transform=ax_text.transAxes)
         
         # Create animations for all four plots
         ani_temp = animation.FuncAnimation(fig, update_temperature_plot, interval=100, cache_frame_data=False)
@@ -1444,3 +1407,165 @@ if __name__ == "__main__":
 # ================================================================================================
 # END OF PROGRAM
 # ================================================================================================
+
+
+
+
+# OLD CODE
+"""
+-- DHT11 Sensor Reader for LabJack T7
+-- Reads temperature and humidity from DHT11 sensor
+-- Results stored in USER_RAM0_F32 (humidity) and USER_RAM1_F32 (temperature)
+-- USER_RAM2_F32 stores success flag (1=success, 0=fail)
+
+local FIO_PIN = 0
+local mbRead = MB.R
+local mbWrite = MB.W
+local checkInterval = 2000
+
+-- Helper function to set pin direction (0=input, 1=output)
+local function setPinDirection(dir)
+  mbWrite(6000 + FIO_PIN, 0, dir)
+end
+
+-- Helper function to write digital state
+local function writePin(state)
+  mbWrite(2000 + FIO_PIN, 0, state)
+end
+
+-- Cache the pin read address for speed
+local pinReadAddr = 2000 + FIO_PIN
+
+-- Initialize pin as output, high
+setPinDirection(1)
+writePin(1)
+
+-- Main reading function using iteration counting
+local function readDHT11()
+  -- Send start signal
+  setPinDirection(1)  -- Output
+  writePin(0)         -- Pull LOW
+  LJ.IntervalConfig(1, 18)
+  LJ.CheckInterval(1) -- Wait 18ms
+  
+  writePin(1)         -- Release (pull high)
+  
+  -- Switch to input
+  setPinDirection(0)
+  
+  -- Small delay
+  for i=1,100 do end
+  
+  -- PROBLEM
+  -- Wait for DHT11 response LOW pulse
+  local timeout = 0
+  while mbRead(pinReadAddr, 0) == 1 do
+    timeout = timeout + 1
+    if timeout > 10000 then
+      return false
+    end
+  end
+  
+  -- Wait for HIGH pulse
+  timeout = 0
+  while mbRead(pinReadAddr, 0) == 0 do
+    timeout = timeout + 1
+    if timeout > 10000 then
+      return false
+    end
+  end
+  
+  -- Wait for next LOW (start of data)
+  timeout = 0
+  while mbRead(pinReadAddr, 0) == 1 do
+    timeout = timeout + 1
+    if timeout > 10000 then
+      return false
+    end
+  end
+  
+  -- Read 40 bits by counting loop iterations during HIGH pulses
+  local bitCounts = {}
+  for i = 1, 40 do
+    -- Wait for HIGH
+    timeout = 0
+    while mbRead(pinReadAddr, 0) == 0 do
+      timeout = timeout + 1
+      if timeout > 10000 then
+        return false
+      end
+    end
+    
+    -- Count iterations while HIGH
+    local count = 0
+    while mbRead(pinReadAddr, 0) == 1 do
+      count = count + 1
+      if count > 10000 then
+        return false
+      end
+    end
+    
+    bitCounts[i] = count
+  end
+  
+  -- Find threshold: average of all counts, or use fixed value
+  local sumCounts = 0
+  for i = 1, 40 do
+    sumCounts = sumCounts + bitCounts[i]
+  end
+  local threshold = sumCounts / 40
+  
+  -- Convert counts to bits (longer count = 1, shorter = 0)
+  local data = {}
+  for i = 1, 40 do
+    if bitCounts[i] > threshold then
+      data[i] = 1
+    else
+      data[i] = 0
+    end
+  end
+  
+  -- Convert bits to bytes
+  local bytes = {}
+  for i = 1, 5 do
+    local byte = 0
+    for j = 1, 8 do
+      byte = byte * 2 + data[(i-1)*8 + j]
+    end
+    bytes[i] = byte
+  end
+  
+  -- Verify checksum
+  local checksum = (bytes[1] + bytes[2] + bytes[3] + bytes[4]) % 256
+  if checksum ~= bytes[5] then
+    return false
+  end
+  
+  -- Extract values
+  local humidity = bytes[1] + bytes[2] * 0.1
+  local temperature = bytes[3] + bytes[4] * 0.1
+  
+  -- Write to USER_RAM registers
+  mbWrite(46000, 3, humidity)
+  mbWrite(46002, 3, temperature)
+  mbWrite(46004, 3, 1)
+  
+  return true
+end
+
+-- Main loop
+LJ.IntervalConfig(0, checkInterval)
+
+while true do
+  if LJ.CheckInterval(0) then
+    local success = readDHT11()
+    if success > 0 then
+      mbWrite(46004, 3, success)
+    end
+    
+    -- Set pin back to output high
+    setPinDirection(1)
+    writePin(1)
+  end
+end
+"""
